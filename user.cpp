@@ -55,7 +55,7 @@ public:
             cout<<"pls enter your password";
             cin>>userpass;
 
-            find_user(username,userpass);
+  //          find_user(username,userpass);
 
         }
 
