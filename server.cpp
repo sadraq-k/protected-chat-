@@ -1,28 +1,39 @@
-//
-// Created by User on 9/13/2024.
-//
 #include <iostream>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
+#include <boost/asio.hpp>
 
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iphlpapi.h>
-#include <stdio.h>
-
-#pragma comment(lib, "Ws2_32.lib")
-#include "EasySocket.hpp"
 using namespace std;
-using namespace masesk;
+using namespace boost::asio;
+using boost::asio::ip::tcp;
 
-void handleData(const std::string &data) {
-    cout << "Client sent: " + data << endl;
-}
+int main()
+{
+        io_context io_context;
 
-int main() {
-    EasySocket socketManager;                      // 1
-    socketManager.socketListen("test", 8080, &handleData); // 2
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string("127.0.0.1"), 1403);
+        tcp::acceptor acceptor(io_context, endpoint);
+
+        while (true) {
+        // ایجاد یک سوکت برای اتصال جدید
+        tcp::socket socket(io_context);
+        acceptor.accept(socket); // اتصال را می‌پذیرد
+
+        // بافر برای ذخیره داده‌های خوانده‌شده
+        std::string buffer(1024, '\0'); // یک رشته با طول 1024 و پر شده با '\0'
+
+        try {
+            // خواندن داده‌ها
+            std::size_t len = socket.read_some(boost::asio::buffer(&buffer[0], buffer.size()));
+            buffer.resize(len); // تغییر اندازه رشته به طول واقعی خوانده شده
+            
+            std::cout << "Received " << len << " bytes: " << buffer << std::endl;
+
+            // ارسال پاسخ به کلاینت (اختیاری)
+            std::string response = "Data received!";
+            boost::asio::write(socket, boost::asio::buffer(response));
+        } catch (std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
+    }
+
     return 0;
 }
