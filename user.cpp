@@ -10,7 +10,7 @@ int main()
     ip::tcp::socket socket(io_context);
     ip::tcp::resolver resolver(io_context);
     
-    connect(socket, resolver.resolve("127.0.0.1", "1403"));
+    connect(socket, resolver.resolve("192.168.155.161", "1403"));
     cout<<"we are connected:)\n";
     cout<<"type your massage\n";
 
