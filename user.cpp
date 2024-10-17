@@ -3,33 +3,44 @@
 
 using namespace std;
 using namespace boost::asio;
-int main()
-{
-    io_context io_context;
 
-    ip::tcp::socket socket(io_context);
-    ip::tcp::resolver resolver(io_context);
-    
-    connect(socket, resolver.resolve("192.168.155.161", "1403"));
-    cout<<"we are connected:)\n";
-    cout<<"type your massage\n";
+// تابعی برای اتصال به سرور
+auto connect_to_server = [](io_context& io, const std::string& host, const std::string& port) -> ip::tcp::socket {
+    ip::tcp::socket socket(io);
+    ip::tcp::resolver resolver(io);
+    connect(socket, resolver.resolve(host, port));
+    cout << "we are connected :)\n";
+    return socket;
+};
 
-    string message ; // پیام برای ارسال به سرور
-    cin>>message;
+// تابعی برای ارسال پیام به سرور
+auto send_message = [](ip::tcp::socket& socket, const std::string& message) {
+    boost::asio::write(socket, boost::asio::buffer(message));
+    cout << "Sent message: " << message << endl;
+};
+
+// تابع اصلی کاربر
+void run_client(const std::string& host, const std::string& port) {
+    io_context io;
+    auto socket = connect_to_server(io, host, port);
+
+    cout << "type your message\n";
+    string message;
+    cin >> message;
 
     try {
-        // ارسال داده به سرور
-        write(socket, boost::asio::buffer(message));
-        cout << "Sent message: " << message << endl;
+        send_message(socket, message);
 
-        // ارسال پاسخ (اختیاری)
+        // ارسال پاسخ دوم (اختیاری)
         string response;
-        getline(std::cin, response);
-        write(socket, boost::asio::buffer(response));
-    } catch (std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        getline(cin, response);
+        send_message(socket, response);
+    } catch (const std::exception& e) {
+        cerr << "Error: " << e.what() << endl;
     }
+}
 
+int main() {
+    run_client("192.168.155.161", "1403");
     return 0;
-
 }

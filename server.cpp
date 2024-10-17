@@ -5,35 +5,46 @@ using namespace std;
 using namespace boost::asio;
 using boost::asio::ip::tcp;
 
-int main()
-{
-        io_context io_context;
+// تابعی برای راه‌اندازی سرور
+auto start_server = [](io_context& io, const std::string& ip, int port) -> tcp::acceptor {
+    tcp::endpoint endpoint(boost::asio::ip::address::from_string(ip), port);
+    tcp::acceptor acceptor(io, endpoint);
+    return acceptor;
+};
 
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string("192.168.155.161"), 1403);
-        tcp::acceptor acceptor(io_context, endpoint);
+// تابعی برای دریافت داده از کلاینت
+auto receive_data = [](tcp::socket& socket) -> std::string {
+    std::string buffer(1024, '\0');
+    std::size_t len = socket.read_some(boost::asio::buffer(&buffer[0], buffer.size()));
+    buffer.resize(len);
+    return buffer;
+};
 
-        while (true) {
-        // ایجاد یک سوکت برای اتصال جدید
-        tcp::socket socket(io_context);
-        acceptor.accept(socket); // اتصال را می‌پذیرد
+// تابعی برای ارسال پاسخ به کلاینت
+auto send_response = [](tcp::socket& socket, const std::string& response) {
+    boost::asio::write(socket, boost::asio::buffer(response));
+};
 
-        // بافر برای ذخیره داده‌های خوانده‌شده
-        std::string buffer(1024, '\0'); // یک رشته با طول 1024 و پر شده با '\0'
+// تابع اصلی سرور
+void run_server(const std::string& ip, int port) {
+    io_context io;
+    auto acceptor = start_server(io, ip, port);
+
+    while (true) {
+        tcp::socket socket(io);
+        acceptor.accept(socket);
 
         try {
-            // خواندن داده‌ها
-            std::size_t len = socket.read_some(boost::asio::buffer(&buffer[0], buffer.size()));
-            buffer.resize(len); // تغییر اندازه رشته به طول واقعی خوانده شده
-            
-            std::cout << "Received " << len << " bytes: " << buffer << std::endl;
-
-            // ارسال پاسخ به کلاینت (اختیاری)
-            std::string response = "Data received!";
-            boost::asio::write(socket, boost::asio::buffer(response));
-        } catch (std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            auto data = receive_data(socket);
+            cout << "Received " << data.size() << " bytes: " << data << endl;
+            send_response(socket, "Data received!");
+        } catch (const std::exception& e) {
+            cerr << "Error: " << e.what() << endl;
         }
     }
+}
 
+int main() {
+    run_server("192.168.155.161", 1403);
     return 0;
 }
