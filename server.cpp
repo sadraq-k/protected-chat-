@@ -45,6 +45,6 @@ void run_server(const std::string& ip, int port) {
 }
 
 int main() {
-    run_server("192.168.155.161", 1403);
+    run_server("127.0.0.1", 1403);
     return 0;
 }
