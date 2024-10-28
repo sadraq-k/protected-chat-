@@ -70,6 +70,6 @@ void run_client(const std::string& host, const std::string& port)
 
 int main() 
 {
-    run_client("127.0.0.1", "1403");
+    run_client("185.79.158.34", "1403");
     return 0;
 }
