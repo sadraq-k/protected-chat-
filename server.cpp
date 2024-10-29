@@ -44,33 +44,57 @@ void run_server(const std::string& ip, int port)
 {
     io_context io;
     int i = 0;
-    auto acceptor = start_server(io, ip, port);
-
+    auto acceptor1 = start_server(io, ip, port);
+     auto acceptor2 = start_server(io, ip, port);
     //برای قبول درخواست های مداوم کلاینت
     while (true) 
     {
-        tcp::socket socket(io);
-        acceptor.accept(socket);
+        tcp::socket socket1(io);
+        acceptor1.accept(socket1);
+
+        tcp::socket socket2(io);
+        acceptor2.accept(socket2);
 
         try {
             //برای مداوم در ارتباط بودن با کلاینت
             while (true) 
             { // ﺢﻠﻘﻫ ﻥﺎﻤﺣﺩﻭﺩ ﺏﺭﺎﯾ ﺩﺮﯾﺎﻔﺗ ﻭ ﺍﺮﺳﺎﻟ ﺩﺍﺪﻫ
-                auto data = receive_data(socket);
-                if (data.empty()) break; // ﺩﺭ ﺹﻭﺮﺗ ﺩﺮﯾﺎﻔﺗ ﺩﺍﺪﻫ ﺥﺎﻠﯾ، ﺢﻠﻘﻫ ﺭﺍ ﺐﺸﮑﻨﯾﺩ
-                if (data == "the end")
+                auto data1 = receive_data(socket1);
+                auto data2 = receive_data(socket2);
+
+                if (data1.empty()) break; // ﺩﺭ ﺹﻭﺮﺗ ﺩﺮﯾﺎﻔﺗ ﺩﺍﺪﻫ ﺥﺎﻠﯾ، ﺢﻠﻘﻫ ﺭﺍ ﺐﺸﮑﻨﯾﺩ
+                if (data2.empty()) break;
+
+
+
+                if (data1 == "the end")
                 {
                     cout<<"\n nice chat bye ;)\n ";
                     exit(0);
                 }
+                if (data2 == "the end")
+                {
+                    cout<<"\n nice chat bye ;)\n ";
+                    exit(0);
+                }
+
+
                 
-                cout << "Received " << data.size() << " bytes: " << data << endl;
+                cout << "Received from client1" << data1.size() << " bytes: " << data1 << endl;
+                cout << "Received from client2" << data2.size() << " bytes: " << data2 << endl;
 
                 cout << "Anything else for client?\n";
-                string willsend;
-                getline(cin, willsend);
 
-                send_response(socket, willsend);
+                string willsend1;
+                string willsend2;
+
+                willsend2 = data1;
+                willsend1 = data2;
+               // getline(cin, willsend1);
+               // getline(cin, willsend2);
+
+                send_response(socket1, willsend1);
+                send_response(socket1, willsend2);
             }
         } catch (const std::exception& e) 
         {
