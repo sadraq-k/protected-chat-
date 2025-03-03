@@ -1,75 +1,60 @@
 #include <iostream>
 #include <boost/asio.hpp>
+#include <thread>
+#include <atomic>
 
 using namespace std;
 using namespace boost::asio;
 
+atomic<bool> running(true);
 
+void receive_messages(ip::tcp::socket& socket) {
+    try {
+        while (running) {
+            string response(1024, '\0');
+            size_t len = socket.read_some(boost::asio::buffer(response));
+            response.resize(len);
+            cout << "Received: " << response << endl;
+        }
+    } catch (const std::exception& e) {
+        if (running) cerr << "Connection lost: " << e.what() << endl;
+    }
+}
 
-// تابعی برای اتصال به سرور
-auto connect_to_server = [](io_context& io, const std::string& host, const std::string& port) -> ip::tcp::socket 
-{
+void run_client(const std::string& host, const std::string& port) {
+    io_context io;
     ip::tcp::socket socket(io);
     ip::tcp::resolver resolver(io);
     connect(socket, resolver.resolve(host, port));
-    cout << "we are connected :)\n";
-    return socket;
-};
+    cout << "Connected to server :)\n";
 
+    thread receive_thread(receive_messages, ref(socket));
 
-
-
-// تابعی برای ارسال پیام به سرور
-auto send_message = [](ip::tcp::socket& socket, const std::string& message) 
-{
-    boost::asio::write(socket, boost::asio::buffer(message));
-    cout << "Sent message: " << message << endl;
-};
-
-
-
-
-// تابع اصلی کاربر
-void run_client(const std::string& host, const std::string& port)
- {
-    io_context io;
-    int i=0;
-    auto socket = connect_to_server(io, host, port);
-
-    while (i <= 10)
-    {
-        cout << "type your message\n";
+    while (running) {
         string message;
-        getline(cin,message);
+        getline(cin, message);
+        if (message.empty()) continue; // نادیده گرفتن پیام خالی
 
-    try {
-        send_message(socket, message);
-
-
-        if (message == "the end")
-        {
-                cout<<"\ngoodbye server XD\n";
-                exit(0);
+        try {
+            boost::asio::write(socket, boost::asio::buffer(message));
+            if (message == "the end") {
+                cout << "Goodbye server!\n";
+                running = false;
+                socket.close();
+                break;
+            }
+        } catch (const std::exception& e) {
+            cerr << "Error: " << e.what() << endl;
+            running = false;
+            break;
         }
+    }
 
-        // خواندن باسخ از سرور
-        string response(1024, '\0'); // بافر برای ذخیره باسخ
-        std::size_t len = socket.read_some(boost::asio::buffer(&response[0], response.size()));
-        response.resize(len); 
-        cout << "Received response: " << response << endl;
-        
-    } catch (const std::exception& e) {
-        cerr << "Error: " << e.what() << endl;
-    }
-    }
-     
-    
+    receive_thread.join();
 }
 
-
-
-int main() 
-{
+int main() {
     run_client("185.79.158.34", "1403");
     return 0;
 }
+

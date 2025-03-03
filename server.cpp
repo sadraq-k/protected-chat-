@@ -2,110 +2,148 @@
 #include <boost/asio.hpp>
 #include <queue>
 #include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <random>
 
 using namespace std;
 using namespace boost::asio;
 using boost::asio::ip::tcp;
-// hello 
-// تابعی برای راه‌اندازی سرور
-auto start_server = [](io_context& io, const std::string& ip, int port) -> tcp::acceptor {
-    tcp::endpoint endpoint(boost::asio::ip::address::from_string(ip), port);
-    tcp::acceptor acceptor(io, endpoint);
-    acceptor.listen();
-    return acceptor;
-};
 
-// تابعی برای دریافت داده از کلاینت
-auto receive_data = [](tcp::socket& socket) -> std::string {
-    std::string buffer(1024, '\0');
-    std::size_t len = socket.read_some(boost::asio::buffer(&buffer[0], buffer.size()));
+mutex mtx;
+unordered_map<string, queue<string>> offline_messages;
+unordered_map<string, shared_ptr<tcp::socket>> clients;
+
+string generate_unique_id()
+{
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> dis(1000, 9999);
+    return "client_" + to_string(dis(gen));
+}
+
+string receive_data(tcp::socket& socket)
+{
+    string buffer(1024, '\0');
+    boost::system::error_code error;
+
+    size_t len = socket.read_some(boost::asio::buffer(buffer), error);
+    if (error == boost::asio::error::eof) throw runtime_error("Client disconnected");
+    if (error) throw boost::system::system_error(error);
+
     buffer.resize(len);
     return buffer;
-};
-
-// تابعی برای ارسال پاسخ به کلاینت
-auto send_response = [](tcp::socket& socket, const std::string& response) {
-    boost::asio::write(socket, boost::asio::buffer(response));
-};
-
-// تابع اصلی سرور
-void run_server(const std::string& ip, int port) {
-    io_context io;
-    auto acceptor = start_server(io, ip, port);
-
-    // اتصال به دو کلاینت و ذخیره سوکت‌ها
-    tcp::socket client1(io);
-    tcp::socket client2(io);
-    bool client1_connected = false, client2_connected = false;
-
-    queue<string> messages_for_client1;
-    queue<string> messages_for_client2;
-
-    // انتظار برای اتصال کلاینت‌ها
-    cout << "Waiting for Client 1 to connect..." << endl;
-    acceptor.async_accept(client1, [&](const boost::system::error_code& error) {
-        if (!error) {
-            client1_connected = true;
-            cout << "Client 1 connected." << endl;
+}
+//shared_ptr<tcp::socket> its tell us which socket u must send.
+void send_response(shared_ptr<tcp::socket> socket, const string& response)
+{
+    boost::system::error_code error;
+    if (socket && socket->is_open())
+    {
+        boost::asio::write(*socket, boost::asio::buffer(response), error);
+        if (error)
+        {
+            cerr << "Failed to send message: " << error.message() << endl;
         }
-    });
-
-    cout << "Waiting for Client 2 to connect..." << endl;
-    acceptor.async_accept(client2, [&](const boost::system::error_code& error) {
-        if (!error) {
-            client2_connected = true;
-            cout << "Client 2 connected." << endl;
-        }
-    });
-
-    io.run();
-
-    try {
-        while (true) {
-            // دریافت پیام از کلاینت اول و ارسال به کلاینت دوم یا ذخیره‌سازی
-            if (client1_connected && client1.available()) {
-                std::string data1 = receive_data(client1);
-                if (!data1.empty()) {
-                    cout << "Client 1: " << data1 << endl;
-                    if (client2_connected) {
-                        send_response(client2, "Client 1: " + data1);
-                    } else {
-                        messages_for_client2.push("Client 1: " + data1);
-                    }
-                }
-            }
-
-            // دریافت پیام از کلاینت دوم و ارسال به کلاینت اول یا ذخیره‌سازی
-            if (client2_connected && client2.available()) {
-                std::string data2 = receive_data(client2);
-                if (!data2.empty()) {
-                    cout << "Client 2: " << data2 << endl;
-                    if (client1_connected) {
-                        send_response(client1, "Client 2: " + data2);
-                    } else {
-                        messages_for_client1.push("Client 2: " + data2);
-                    }
-                }
-            }
-
-            // ارسال پیام‌های ذخیره‌شده به کلاینت اول
-            if (client1_connected && !messages_for_client1.empty()) {
-                send_response(client1, messages_for_client1.front());
-                messages_for_client1.pop();
-            }
-
-            // ارسال پیام‌های ذخیره‌شده به کلاینت دوم
-            if (client2_connected && !messages_for_client2.empty()) {
-                send_response(client2, messages_for_client2.front());
-                messages_for_client2.pop();
-            }
-        }
-    } catch (const std::exception& e) {
-        cerr << "Error: " << e.what() << endl;
     }
 }
 
-int main() {
-    run_server("192.168.57.10", 1403);
+void send_pending_messages(const string& client_id, shared_ptr<tcp::socket> socket)
+{
+    lock_guard<mutex> lock(mtx);
+    auto& messages = offline_messages[client_id];
+    while (!messages.empty() && socket && socket->is_open())
+    {
+        send_response(socket, messages.front());
+        messages.pop();
+    }
+}
+
+void broadcast_message(const string& sender_id, const string& message)
+{
+    lock_guard<mutex> lock(mtx);
+    auto it = clients.begin();
+    while (it != clients.end())
+    {
+        if (it->first != sender_id)
+        {
+            if (it->second && it->second->is_open())
+            {
+                send_response(it->second, sender_id + ": " + message);
+                ++it;
+            } else
+            {
+                offline_messages[it->first].push(sender_id + ": " + message);
+                it = clients.erase(it); // حذف کلاینت غیرفعال
+            }
+        } else {
+            ++it;
+        }
+    }
+}
+
+void handle_client(shared_ptr<tcp::socket> socket)
+{
+    string client_id;
+    try {
+        client_id = generate_unique_id();
+        {
+            lock_guard<mutex> lock(mtx);
+            clients[client_id] = socket;
+        }
+        send_response(socket, "Your ID: " + client_id);
+        send_pending_messages(client_id, socket);
+
+        while (true) {
+            string message = receive_data(*socket);
+            cout << "Received from " << client_id << ": " << message << endl;
+
+            if (message == "the end")
+            {
+                cout << "Client " << client_id << " disconnected.\n";
+                break;
+            }
+
+            broadcast_message(client_id, message);
+            send_response(socket, "Message received");
+        }
+    } catch (const exception& e)
+    {
+        cerr << "Client " << client_id << " error: " << e.what() << endl;
+    }
+
+    // حذف کلاینت از لیست بعد از قطع اتصال
+    lock_guard<mutex> lock(mtx);
+    clients.erase(client_id);
+}
+
+void run_server(const string& ip, int port)
+{
+    io_context io;
+    tcp::acceptor acceptor(io, tcp::endpoint(ip::address::from_string(ip), port));
+    cout << "Server running on " << ip << ":" << port << endl;
+
+    while (true) {
+        try {
+            auto socket = make_shared<tcp::socket>(io);
+            acceptor.accept(*socket);
+            thread(handle_client, socket).detach();
+        } catch (const exception& e)
+        {
+            cerr << "Accept error: " << e.what() << endl;
+        }
+    }
+}
+
+int main()
+{
+    try
+    {
+        run_server("192.168.57.10", 1403);
+    } catch (const exception& e)
+    {
+        cerr << "Server error: " << e.what() << endl;
+    }
     return 0;
 }
