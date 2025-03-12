@@ -8,6 +8,7 @@
 using namespace std;
 
 int insert_data(sqlite3 *db ,string name,string username,string how_they_find_us);
+void add_column(sqlite3* db);
 
 int main()
 {
@@ -55,9 +56,10 @@ int main()
         cout<<"table  succesfuly create"<<endl;
 
 
-    string name = "sadra" , username = "sadraq" , how_they_find_us = "so hard";
+    /*string name = "sadra" , username = "sadraq" , how_they_find_us = "so hard";
     insert_data(db,name,username,how_they_find_us);
-
+    */
+    add_column(db);
 
 
     sqlite3_close(db);
@@ -95,6 +97,22 @@ int insert_data(sqlite3 *db ,string name,string username,string how_they_find_us
 
     return 0;
 }
+
+void add_column(sqlite3* db)
+{
+    const char* sql = "ALTER TABLE users ADD COLUMN password TEXT ;";
+    char* errmsg = nullptr;
+
+    int rc = sqlite3_exec(db, sql, 0, 0, &errmsg);
+
+    if (rc != SQLITE_OK) {
+        cerr << "Error adding column: " << errmsg << endl;
+        sqlite3_free(errmsg);
+    } else {
+        cout << "Column added successfully!" << endl;
+    }
+}
+
 
 
 
