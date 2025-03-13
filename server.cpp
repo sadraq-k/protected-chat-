@@ -1,81 +1,56 @@
-#include <iostream>
 #include <boost/asio.hpp>
-#include <queue>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <memory>
-#include <random>
+#include <sstream>
+#include <vector>
+#include "database.h"
 
-using namespace std;
 using namespace boost::asio;
-using boost::asio::ip::tcp;
+using namespace boost::asio::ip;
 
-mutex mtx;
-unordered_map<string, queue<string>> offline_messages;
-unordered_map<string, shared_ptr<tcp::socket>> clients;
+std::mutex mtx;
+std::unordered_map<std::string, std::shared_ptr<tcp::socket>> clients;
+Database db("chat.db");
 
-string generate_unique_id()
-{
-    random_device rd;
-    mt19937 gen(rd());
-    uniform_int_distribution<> dis(1000, 9999);
-    return "client_" + to_string(dis(gen));
-}
-
-string receive_data(tcp::socket& socket)
-{
-    string buffer(1024, '\0');
-    boost::system::error_code error;
-
-    size_t len = socket.read_some(boost::asio::buffer(buffer), error);
-    if (error == boost::asio::error::eof) throw runtime_error("Client disconnected");
-    if (error) throw boost::system::system_error(error);
-
-    buffer.resize(len);
-    return buffer;
-}
-//shared_ptr<tcp::socket> its tell us which socket u must send.
-void send_response(shared_ptr<tcp::socket> socket, const string& response)
-{
-    boost::system::error_code error;
-    if (socket && socket->is_open())
-    {
-        boost::asio::write(*socket, boost::asio::buffer(response), error);
-        if (error)
-        {
-            cerr << "Failed to send message: " << error.message() << endl;
-        }
+void sendResponse(std::shared_ptr<tcp::socket> socket, const std::string& response) {
+    if (socket && socket->is_open()) {
+        boost::asio::write(*socket, boost::asio::buffer(response + "\n"));
     }
 }
 
-void send_pending_messages(const string& client_id, shared_ptr<tcp::socket> socket)
-{
-    lock_guard<mutex> lock(mtx);
-    auto& messages = offline_messages[client_id];
-    while (!messages.empty() && socket && socket->is_open())
-    {
-        send_response(socket, messages.front());
-        messages.pop();
+std::string receiveData(tcp::socket& socket) {
+    boost::asio::streambuf buf;
+    boost::asio::read_until(socket, buf, "\n");
+    std::istream is(&buf);
+    std::string line;
+    std::getline(is, line);
+    return line;
+}
+
+// تابع برای ارسال پیام به یک کاربر خاص
+void sendMessageToUser(const std::string& sender, const std::string& receiver, const std::string& message) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = clients.find(receiver);
+    if (it != clients.end() && it->second && it->second->is_open()) {
+        sendResponse(it->second, sender + ": " + message);
+    } else {
+        db.storeOfflineMessage(sender, receiver, message);
     }
 }
 
-void broadcast_message(const string& sender_id, const string& message)
-{
-    lock_guard<mutex> lock(mtx);
-    auto it = clients.begin();
-    while (it != clients.end())
-    {
-        if (it->first != sender_id)
-        {
-            if (it->second && it->second->is_open())
-            {
-                send_response(it->second, sender_id + ": " + message);
+// تابع برای پخش پیام به همه کاربران
+void broadcastMessage(const std::string& sender, const std::string& message) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto it = clients.begin(); it != clients.end();) {
+        if (it->first != sender) {
+            if (it->second && it->second->is_open()) {
+                sendResponse(it->second, sender + ": " + message);
                 ++it;
-            } else
-            {
-                offline_messages[it->first].push(sender_id + ": " + message);
-                it = clients.erase(it); // حذف کلاینت غیرفعال
+            } else {
+                db.storeOfflineMessage(sender, it->first, message);
+                it = clients.erase(it);
             }
         } else {
             ++it;
@@ -83,67 +58,112 @@ void broadcast_message(const string& sender_id, const string& message)
     }
 }
 
-void handle_client(shared_ptr<tcp::socket> socket)
-{
-    string client_id;
+void handleClient(std::shared_ptr<tcp::socket> socket) {
+    std::string username;
     try {
-        client_id = generate_unique_id();
-        {
-            lock_guard<mutex> lock(mtx);
-            clients[client_id] = socket;
+        std::string request = receiveData(*socket);
+        std::istringstream iss(request);
+        std::string token;
+        std::getline(iss, token, ':');
+        if (token == "SIGN_IN") {
+            std::string name, username_temp, password;
+            std::getline(iss, name, ':');
+            std::getline(iss, username_temp, ':');
+            std::getline(iss, password, ':');
+            if (db.insertUser(name, username_temp, password)) {
+                sendResponse(socket, "SUCCESS:Your ID: " + username_temp);
+                username = username_temp;
+            } else {
+                sendResponse(socket, "FAIL:Username exists");
+                socket->close();
+                return;
+            }
+        } else if (token == "LOG_IN") {
+            std::string username_temp, password;
+            std::getline(iss, username_temp, ':');
+            std::getline(iss, password, ':');
+            if (db.validateLogin(username_temp, password)) {
+                sendResponse(socket, "SUCCESS:Your ID: " + username_temp);
+                username = username_temp;
+            } else {
+                sendResponse(socket, "FAIL:Invalid credentials");
+                socket->close();
+                return;
+            }
+        } else {
+            sendResponse(socket, "FAIL:Invalid request");
+            socket->close();
+            return;
         }
-        send_response(socket, "Your ID: " + client_id);
-        send_pending_messages(client_id, socket);
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            clients[username] = socket;
+        }
+
+        auto messages = db.getOfflineMessages(username);
+        for (const auto& msg : messages) {
+            sendResponse(socket, msg);
+        }
+        db.clearOfflineMessages(username);
 
         while (true) {
-            string message = receive_data(*socket);
-            cout << "Received from " << client_id << ": " << message << endl;
-
-            if (message == "the end")
-            {
-                cout << "Client " << client_id << " disconnected.\n";
+            std::string message = receiveData(*socket);
+            if (message == "the end") {
                 break;
             }
 
-            broadcast_message(client_id, message);
-            send_response(socket, "Message received");
-        }
-    } catch (const exception& e)
-    {
-        cerr << "Client " << client_id << " error: " << e.what() << endl;
-    }
+            std::istringstream msgIss(message);
+            std::string msgType;
+            std::getline(msgIss, msgType, ':');
 
-    // حذف کلاینت از لیست بعد از قطع اتصال
-    lock_guard<mutex> lock(mtx);
-    clients.erase(client_id);
+            if (msgType == "PRIVATE") {
+                std::string receiver, msgContent;
+                std::getline(msgIss, receiver, ':');
+                std::getline(msgIss, msgContent);
+                sendMessageToUser(username, receiver, msgContent);
+            } else if (msgType == "GROUP") {
+                std::string receivers, msgContent;
+                std::getline(msgIss, receivers, ':');
+                std::getline(msgIss, msgContent);
+                std::istringstream receiversIss(receivers);
+                std::string receiver;
+                while (std::getline(receiversIss, receiver, ',')) {
+                    sendMessageToUser(username, receiver, msgContent);
+                }
+            } else {
+                broadcastMessage(username, message);
+            }
+            sendResponse(socket, "Message received");
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Client " << username << " error: " << e.what() << std::endl;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    clients.erase(username);
+    if (socket->is_open()) {
+        socket->close();
+    }
+    std::cout << "Client " << username << " disconnected." << std::endl;
 }
 
-void run_server(const string& ip, int port)
-{
+void runServer(const std::string& ip, int port) {
     io_context io;
-    tcp::acceptor acceptor(io, tcp::endpoint(ip::address::from_string(ip), port));
-    cout << "Server running on " << ip << ":" << port << endl;
+    tcp::acceptor acceptor(io, tcp::endpoint(address::from_string(ip), port));
+    std::cout << "Server running on " << ip << ":" << port << std::endl;
 
     while (true) {
-        try {
-            auto socket = make_shared<tcp::socket>(io);
-            acceptor.accept(*socket);
-            thread(handle_client, socket).detach();
-        } catch (const exception& e)
-        {
-            cerr << "Accept error: " << e.what() << endl;
-        }
+        auto socket = std::make_shared<tcp::socket>(io);
+        acceptor.accept(*socket);
+        std::thread(handleClient, socket).detach();
     }
 }
 
-int main()
-{
-    try
-    {
-        run_server("192.168.57.10", 1403);
-    } catch (const exception& e)
-    {
-        cerr << "Server error: " << e.what() << endl;
+int main() {
+    try {
+        runServer("192.168.57.10", 1403);
+    } catch (const std::exception& e) {
+        std::cerr << "Server error: " << e.what() << std::endl;
     }
     return 0;
 }
