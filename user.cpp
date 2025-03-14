@@ -17,6 +17,7 @@ void receiveMessages(tcp::socket& socket) {
             std::istream is(&buf);
             std::string line;
             std::getline(is, line);
+            if (line.empty()) continue;  // جلوگیری از پردازش پیام‌های خالی
             std::cout << "Received: " << line << std::endl;
         }
     } catch (const std::exception& e) {
@@ -32,8 +33,14 @@ void runClient(const std::string& host, const std::string& port) {
     io_context io;
     tcp::socket socket(io);
     tcp::resolver resolver(io);
-    connect(socket, resolver.resolve(host, port));
-    std::cout << "Connected to server :)\n";
+
+    try {
+        connect(socket, resolver.resolve(host, port));
+        std::cout << "Connected to server :)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error connecting to server: " << e.what() << std::endl;
+        return;
+    }
 
     std::string choice;
     std::cout << "Enter 1 for sign in, 2 for log in: ";
@@ -49,6 +56,12 @@ void runClient(const std::string& host, const std::string& port) {
         std::getline(std::cin, username);
         std::cout << "Enter password: ";
         std::getline(std::cin, password);
+        
+        if (name.empty() || username.empty() || password.empty()) {
+            std::cerr << "All fields must be filled!\n";
+            return;
+        }
+
         request = "SIGN_IN:" + name + ":" + username + ":" + password;
     } else if (choice == "2") {
         std::string username, password;
@@ -56,15 +69,33 @@ void runClient(const std::string& host, const std::string& port) {
         std::getline(std::cin, username);
         std::cout << "Enter password: ";
         std::getline(std::cin, password);
+
+        if (username.empty() || password.empty()) {
+            std::cerr << "Username and password must not be empty!\n";
+            return;
+        }
+
         request = "LOG_IN:" + username + ":" + password;
     } else {
         std::cout << "Invalid choice\n";
         return;
     }
 
-    boost::asio::write(socket, boost::asio::buffer(request + "\n"));
+    try {
+        boost::asio::write(socket, boost::asio::buffer(request + "\n"));
+    } catch (const std::exception& e) {
+        std::cerr << "Error sending data: " << e.what() << std::endl;
+        return;
+    }
+
     boost::asio::streambuf buf;
-    boost::asio::read_until(socket, buf, "\n");
+    try {
+        boost::asio::read_until(socket, buf, "\n");
+    } catch (const std::exception& e) {
+        std::cerr << "Error receiving response: " << e.what() << std::endl;
+        return;
+    }
+
     std::istream is(&buf);
     std::string response;
     std::getline(is, response);
@@ -79,17 +110,26 @@ void runClient(const std::string& host, const std::string& port) {
     std::thread receiveThread(receiveMessages, std::ref(socket));
     while (running) {
         std::string message;
-        std::cout << "Enter message (e.g., 'PRIVATE:username:message', 'GROUP:user1,user2:message', or 'message'): ";
+        std::cout << "Enter message (or 'the end' to quit): ";
         std::getline(std::cin, message);
+
         if (message.empty()) continue;
-        boost::asio::write(socket, boost::asio::buffer(message + "\n"));
-        if (message == "the end") {
-            running = false;
-            if (socket.is_open()) {
-                socket.close();
-            }
+        
+        try {
+            boost::asio::write(socket, boost::asio::buffer(message + "\n"));
+        } catch (const std::exception& e) {
+            std::cerr << "Error sending message: " << e.what() << std::endl;
             break;
         }
+
+        if (message == "the end") {
+            running = false;
+            break;
+        }
+    }
+    
+    if (socket.is_open()) {
+        socket.close();
     }
     receiveThread.join();
 }
