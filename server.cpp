@@ -6,7 +6,9 @@
 #include <sstream>
 #include <vector>
 #include "database.h"
+#include <iostream>
 
+using namespace std;
 using namespace boost::asio;
 using namespace boost::asio::ip;
 
