@@ -1,0 +1,19 @@
+nohup: ignoring input
+[DB] Opening database: chat.db
+[DB] Database opened successfully
+[DB] Executing query: CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,username TEXT NOT NULL UNIQUE,pwd TEXT NOT NULL);
+[DB] Query executed successfully
+[DB] Executing query: CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT,sender TEXT NOT NULL,receiver TEXT NOT NULL,message TEXT NOT NULL);
+[DB] Query executed successfully
+[DB] Tables created successfully
+[DB] Checking users table columns: id name username pwd 
+[Server] Running on 192.168.57.10:1403
+[CLIENT] New client connected
+[RECEIVE] Raw data: GET / HTTP/1.1
+[ERROR] Invalid JSON: [json.exception.parse_error.101] parse error at line 1, column 1: syntax error while parsing value - invalid literal; last read: 'G'
+[ERROR] Client  error: [json.exception.parse_error.101] parse error at line 1, column 1: syntax error while parsing value - invalid literal; last read: 'G'
+[CLIENT] Disconnected: 
+[CLIENT] New client connected
+[ERROR] Receive error: read_until: End of file
+[ERROR] Client  error: read_until: End of file
+[CLIENT] Disconnected: 
