@@ -225,7 +225,7 @@ void runServer(const std::string& ip, int port) {
 
 int main() {
     try {
-        runServer("127.0.0.1", 1403);
+        runServer("192.168.57.10", 1403);
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Server error: " << e.what() << std::endl;
         return 1;

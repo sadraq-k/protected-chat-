@@ -14,7 +14,7 @@ Database::Database(const std::string& dbname) : db(nullptr) {
                       "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                       "name TEXT NOT NULL,"
                       "username TEXT NOT NULL UNIQUE,"
-                      "pwd TEXT NOT NULL);";
+                      "pwd TEXT NOT NULL);";// comment text 
     executeQuery(sql);
     sql = "CREATE TABLE IF NOT EXISTS messages ("
           "id INTEGER PRIMARY KEY AUTOINCREMENT,"
