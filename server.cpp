@@ -7,17 +7,24 @@
 #include <sstream>
 #include <vector>
 #include <iostream>
+
+#include <boost/asio/ssl.hpp>
+#include <string>
+
 #include "database.h"
+#include "socketHelperFunctions.hpp"
 
 using namespace std;
 using namespace boost::asio;
 using namespace boost::asio::ip;
 using json = nlohmann::json;
-
+/*
 std::mutex mtx;
 std::unordered_map<std::string, std::shared_ptr<tcp::socket>> clients;
 Database db("chat.db");
-
+*/
+//old code
+/*
 void sendResponse(std::shared_ptr<tcp::socket> socket, const json& response) {
     if (!socket || !socket->is_open()) {
         std::cerr << "[ERROR] Socket is closed or invalid" << std::endl;
@@ -28,7 +35,8 @@ void sendResponse(std::shared_ptr<tcp::socket> socket, const json& response) {
         std::cout << "[SEND] Sending response: " << data; // لاگ
         boost::asio::write(*socket, boost::asio::buffer(data));
         std::cout << "[SEND] Response sent successfully" << std::endl;
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "[ERROR] Failed to send response: " << e.what() << std::endl;
     }
 }
@@ -48,10 +56,12 @@ json receiveData(tcp::socket& socket) {
             throw std::runtime_error("Empty message received");
         }
         return json::parse(line);
-    } catch (const json::parse_error& e) {
+    }
+    catch (const json::parse_error& e) {
         std::cerr << "[ERROR] Invalid JSON: " << e.what() << std::endl;
         throw;
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "[ERROR] Receive error: " << e.what() << std::endl;
         throw;
     }
@@ -60,29 +70,32 @@ json receiveData(tcp::socket& socket) {
 void sendMessageToUser(const std::string& sender, const std::string& receiver, const std::string& message) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = clients.find(receiver);
-    json response = {{"type", "MESSAGE"}, {"sender", sender}, {"content", message}};
+    json response = { {"type", "MESSAGE"}, {"sender", sender}, {"content", message} };
     if (it != clients.end() && it->second && it->second->is_open()) {
         std::cout << "[MESSAGE] Sending to " << receiver << std::endl; // لاگ
         sendResponse(it->second, response);
-    } else {
+    }
+    else {
         std::cout << "[MESSAGE] Storing offline message for " << receiver << std::endl; // لاگ
-        db.storeOfflineMessages(sender, receiver, message); // اصلاح نام تابع
+        db.storeOfflineMessage(sender, receiver, message); // اصلاح نام تابع
     }
 }
 
 void broadcastMessage(const std::string& sender, const std::string& message) {
     std::lock_guard<std::mutex> lock(mtx);
-    json response = {{"type", "MESSAGE"}, {"sender", sender}, {"content", message}};
+    json response = { {"type", "MESSAGE"}, {"sender", sender}, {"content", message} };
     for (auto it = clients.begin(); it != clients.end();) {
         if (it->first != sender) {
             if (it->second && it->second->is_open()) {
                 sendResponse(it->second, response);
                 ++it;
-            } else {
-                db.storeOfflineMessages(sender, it->first, message); // اصلاح نام تابع
+            }
+            else {
+                db.storeOfflineMessage(sender, it->first, message); // اصلاح نام تابع
                 it = clients.erase(it);
             }
-        } else {
+        }
+        else {
             ++it;
         }
     }
@@ -103,39 +116,43 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
             std::string password = request.value("password", "");
             std::cout << "[SIGN_IN] Attempt: name=" << name << ", username=" << username_temp << std::endl; // لاگ
             if (name.empty() || username_temp.empty() || password.empty()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "All fields are required"}});
+                sendResponse(socket, { {"status", "FAIL"}, {"message", "All fields are required"} });
                 std::cout << "[SIGN_IN] Failed: Missing fields" << std::endl; // لاگ
                 return;
             }
             if (db.insertUser(name, username_temp, password)) {
-                sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
+                sendResponse(socket, { {"status", "SUCCESS"}, {"message", "Your ID: " + username_temp} });
                 std::cout << "[SIGN_IN] Success: " << username_temp << std::endl; // لاگ
                 username = username_temp;
-            } else {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Username exists"}});
+            }
+            else {
+                sendResponse(socket, { {"status", "FAIL"}, {"message", "Username exists"} });
                 std::cout << "[SIGN_IN] Failed: Username exists" << std::endl; // لاگ
                 return;
             }
-        } else if (action == "LOG_IN") {
+        }
+        else if (action == "LOG_IN") {
             std::string username_temp = request.value("username", "");
             std::string password = request.value("password", "");
             std::cout << "[LOG_IN] Attempt: username=" << username_temp << std::endl; // لاگ
             if (username_temp.empty() || password.empty()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Username and password required"}});
+                sendResponse(socket, { {"status", "FAIL"}, {"message", "Username and password required"} });
                 std::cout << "[LOG_IN] Failed: Missing fields" << std::endl; // لاگ
                 return;
             }
-            if (db.verifyLogin(username_temp, password)) { // اصلاح نام تابع
-                sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
+            if (db.validateLogin(username_temp, password)) { // اصلاح نام تابع
+                sendResponse(socket, { {"status", "SUCCESS"}, {"message", "Your ID: " + username_temp} });
                 std::cout << "[LOG_IN] Success: " << username_temp << std::endl; // لاگ
                 username = username_temp;
-            } else {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid credentials"}});
+            }
+            else {
+                sendResponse(socket, { {"status", "FAIL"}, {"message", "Invalid credentials"} });
                 std::cout << "[LOG_IN] Failed: Invalid credentials" << std::endl; // لاگ
                 return;
             }
-        } else {
-            sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid action"}});
+        }
+        else {
+            sendResponse(socket, { {"status", "FAIL"}, {"message", "Invalid action"} });
             std::cout << "[CLIENT] Invalid action: " << action << std::endl; // لاگ
             return;
         }
@@ -143,7 +160,7 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
         {
             std::lock_guard<std::mutex> lock(mtx);
             if (clients.find(username) != clients.end()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "User already logged in"}});
+                sendResponse(socket, { {"status", "FAIL"}, {"message", "User already logged in"} });
                 std::cout << "[CLIENT] Failed: " << username << " already logged in" << std::endl; // لاگ
                 return;
             }
@@ -153,7 +170,7 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
 
         auto messages = db.getOfflineMessages(username);
         for (const auto& msg : messages) {
-            json response = {{"type", "MESSAGE"}, {"sender", msg.sender}, {"content", msg.message}};
+            json response = { {"type", "MESSAGE"}, {"sender", msg.se}, {"content", msg.message} };
             sendResponse(socket, response);
         }
         db.clearOfflineMessages(username);
@@ -164,16 +181,19 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
             std::cout << "[CLIENT] Message type: " << msgType << std::endl; // لاگ
             if (msgType == "EXIT") {
                 break;
-            } else if (msgType == "PRIVATE") {
+            }
+            else if (msgType == "PRIVATE") {
                 std::string receiver = message.value("receiver", "");
                 std::string content = message.value("content", "");
                 if (!receiver.empty() && !content.empty()) {
                     sendMessageToUser(username, receiver, content);
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Private message sent"}});
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid private message format"}});
+                    sendResponse(socket, { {"status", "SUCCESS"}, {"message", "Private message sent"} });
                 }
-            } else if (msgType == "GROUP") {
+                else {
+                    sendResponse(socket, { {"status", "FAIL"}, {"message", "Invalid private message format"} });
+                }
+            }
+            else if (msgType == "GROUP") {
                 std::vector<std::string> receivers;
                 for (const auto& r : message.value("receivers", json::array())) {
                     receivers.push_back(r.get<std::string>());
@@ -183,21 +203,25 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
                     for (const auto& receiver : receivers) {
                         sendMessageToUser(username, receiver, content);
                     }
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Group message sent"}});
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid group message format"}});
+                    sendResponse(socket, { {"status", "SUCCESS"}, {"message", "Group message sent"} });
                 }
-            } else {
+                else {
+                    sendResponse(socket, { {"status", "FAIL"}, {"message", "Invalid group message format"} });
+                }
+            }
+            else {
                 std::string content = message.value("content", "");
                 if (!content.empty()) {
                     broadcastMessage(username, content);
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Broadcast message sent"}});
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid broadcast message format"}});
+                    sendResponse(socket, { {"status", "SUCCESS"}, {"message", "Broadcast message sent"} });
+                }
+                else {
+                    sendResponse(socket, { {"status", "FAIL"}, {"message", "Invalid broadcast message format"} });
                 }
             }
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "[ERROR] Client " << username << " error: " << e.what() << std::endl;
     }
     std::lock_guard<std::mutex> lock(mtx);
@@ -218,7 +242,8 @@ void runServer(const std::string& ip, int port) {
             acceptor.accept(*socket);
             std::thread(handleClient, socket).detach();
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "[ERROR] Server error: " << e.what() << std::endl;
     }
 }
@@ -226,8 +251,180 @@ void runServer(const std::string& ip, int port) {
 int main() {
     try {
         runServer("192.168.57.10", 1403);
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << "[ERROR] Server error: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
+*/
+/*
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using ssl_socket = asio::ssl::stream<tcp::socket>;
+*/
+// Helper to manage the SSL context for the server
+class tls_server_context {
+public:
+    tls_server_context(boost::asio::ssl::context& ssl_ctx) : ssl_ctx_(ssl_ctx) {}
+
+    // Load certificate and key
+    void load_files(const std::string& cert_chain_file, const std::string& private_key_file) {
+        ssl_ctx_.use_certificate_chain_file(cert_chain_file);
+        ssl_ctx_.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
+    }
+
+private:
+    boost::asio::ssl::context& ssl_ctx_;
+};
+
+// Handles individual client connections
+class clientSession : public std::enable_shared_from_this<clientSession> {
+public:
+    // The constructor now takes the actual tcp::socket to wrap
+    clientSession(tcp::socket socket, boost::asio::ssl::context& ssl_ctx)
+        : stream_(std::move(socket), ssl_ctx) {} // Initialize stream_ by moving the socket into it
+
+    // Use this socket for the connection
+    boost::asio::ssl::stream<tcp::socket>::next_layer_type& socket() {
+        return stream_.next_layer();
+    }
+
+    // Start the TLS handshake and then begin reading/writing
+    void start() {
+        boost::asio::co_spawn(
+            stream_.get_executor(), // Use the executor from the stream
+            [self = shared_from_this()]() -> boost::asio::awaitable<void> {
+                try {
+                    // Perform the TLS handshake
+                    co_await self->stream_.async_handshake
+                    (boost::asio::ssl::stream_base::server, boost::asio::use_awaitable);
+                    std::cout << "Client connected and TLS handshake successful." << std::endl;
+
+                    // Now, start echoing data
+                    co_await self->do_read_write();
+                }
+                catch (const boost::system::system_error& ec) {
+                    if (ec.code() == boost::asio::error::eof ||
+                        ec.code() == boost::asio::ssl::error::stream_truncated) {
+                        std::cout << "Client disconnected gracefully." << std::endl;
+                    }
+                    else {
+                        std::cerr << "TLS handshake or stream error: " << ec.what() << std::endl;
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "Error in session: " << e.what() << std::endl;
+                }
+            },
+            boost::asio::detached // Detach the coroutine, it runs independently
+        );
+    }
+
+private:
+    // Coroutine to read from the client and write back
+    boost::asio::awaitable<void> do_read_write() {
+        std::vector<char> message_buffer;
+        for (;;) {
+            // Read data from the client  
+            std::string message;
+            co_await readFromSocket(stream_, message_buffer, message);
+            // Echo the data back to the client
+            co_await write_message(stream_, message);
+        }
+    }
+
+    boost::asio::ssl::stream<tcp::socket> stream_; // The TLS-wrapped socket    
+};
+
+// The main server class that accepts connections
+class Server {
+public:
+    Server(boost::asio::io_context& io_context,
+        boost::asio::ssl::context& ssl_ctx, short port)
+        : acceptor_(io_context, boost::asio::ip::tcp::endpoint
+        (boost::asio::ip::tcp::v4(), boost::asio::ip::port_type(port))),
+        ssl_ctx_(ssl_ctx) {
+        // Configure the server's SSL context (certificate and key)
+        tls_server_context server_ctx(ssl_ctx_);
+        // IMPORTANT: Replace "server.pem" and "server.key" with your actual files
+        // For testing, you can generate self-signed certificates.
+        try {
+            server_ctx.load_files("server.pem", "server.key");
+            std::cout << "Server certificate and key loaded." << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Failed to load server certificate/key: " << e.what() << std::endl;
+            exit(1);
+        }
+        do_accept(); // Start accepting connections
+    }
+private:
+    // Asynchronously accept new connections
+    void do_accept() {
+        acceptor_.async_accept(
+            [this](boost::system::error_code ec,
+                boost::asio::ip::tcp::socket socket) {
+                    if (!ec) {
+                        // Create a new session for the accepted client
+                        std::make_shared<clientSession>
+                            (std::move(socket), ssl_ctx_)->start();
+                    }
+                    else {
+                        std::cerr << "Accept error: " << ec.message() << std::endl;
+                    }
+                    // Continue accepting more connections
+                    do_accept();
+            });
+    }
+
+    boost::asio::ip::tcp::acceptor acceptor_;       // Listens for incoming connections
+    boost::asio::ssl::context& ssl_ctx_;  // SSL context for the server
+};
+
+int main() {
+    try {
+
+        boost::asio::io_context io_context;
+
+        // Create an SSL context for the server.
+        // We use tlsv12 for better compatibility, but you might want tlsv13.
+        boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12);
+
+        // Configure SSL options: disable older, less secure protocols
+        ssl_ctx.set_options(
+            boost::asio::ssl::context::default_workarounds |
+            boost::asio::ssl::context::no_sslv2 |
+            boost::asio::ssl::context::no_sslv3 |
+            boost::asio::ssl::context::no_tlsv1 |
+            boost::asio::ssl::context::no_tlsv1_1);
+
+        // IMPORTANT: Make sure server.pem and server.key are in the same directory
+        // or provide the full path.
+        Server server(io_context, ssl_ctx, 1403);
+        //runServer("192.168.57.10", 1403)
+        std::cout << "TLS Echo Server started " << std::endl;
+
+        // Run the io_context to process asynchronous operations
+        unsigned int thread_count = std::thread::hardware_concurrency();
+        if (thread_count == 0) thread_count = 2; // Default to 2 threads if hardware_concurrency is not available
+
+        // Launch threads that run the io_context
+        std::vector<std::thread> threads;
+        for (unsigned int i = 0; i < thread_count; ++i) {
+            threads.emplace_back([&io_context]() {
+                io_context.run(); // Each thread runs the io_context event loop
+                });
+        }
+        // Join all threads to keep the main thread alive
+        for (auto& t : threads) {
+            t.join();
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Server exception: " << e.what() << std::endl;
         return 1;
     }
     return 0;
