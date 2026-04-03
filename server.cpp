@@ -7,6 +7,7 @@
 #include <sstream>
 #include <vector>
 #include <iostream>
+#include <set>
 
 #include <boost/asio/ssl.hpp>
 #include <string>
@@ -281,6 +282,10 @@ private:
 };
 
 // Handles individual client connections
+std::mutex clientSessionsMutex;
+class clientSession;
+std::set<std::shared_ptr<clientSession>> clientSessions;
+void BroadcastMessege(std::string messege);
 class clientSession : public std::enable_shared_from_this<clientSession> {
 public:
     // The constructor now takes the actual tcp::socket to wrap
@@ -291,7 +296,10 @@ public:
     boost::asio::ssl::stream<tcp::socket>::next_layer_type& socket() {
         return stream_.next_layer();
     }
-
+    bool operator<(const clientSession& other)
+    {
+        return (stream_.lowest_layer().local_endpoint() < other.stream_.lowest_layer().local_endpoint());
+    }
     // Start the TLS handshake and then begin reading/writing
     void start() {
         boost::asio::co_spawn(
@@ -318,11 +326,15 @@ public:
                 catch (const std::exception& e) {
                     std::cerr << "Error in session: " << e.what() << std::endl;
                 }
+                {
+                    std::lock_guard<std::mutex> lock(clientSessionsMutex);
+                    clientSessions.erase(self);
+                }
             },
             boost::asio::detached // Detach the coroutine, it runs independently
         );
     }
-
+    boost::asio::ssl::stream<tcp::socket> stream_; // The TLS-wrapped socket   
 private:
     // Coroutine to read from the client and write back
     boost::asio::awaitable<void> do_read_write() {
@@ -332,20 +344,63 @@ private:
             std::string message;
             co_await readFromSocket(stream_, message_buffer, message);
             // Echo the data back to the client
-            co_await write_message(stream_, message);
+            //co_await write_message(stream_, message);
+            BroadcastMessege(message);
         }
     }
 
-    boost::asio::ssl::stream<tcp::socket> stream_; // The TLS-wrapped socket    
-};
 
+};
+struct clientSessionSharedPtr
+{
+    bool operator()(std::shared_ptr<clientSession> const& x,
+        std::shared_ptr<clientSession> const& y)
+    {
+        return *x < *y;
+    }
+};
+void BroadcastMessege(std::string messege)
+{
+    std::set<std::shared_ptr<clientSession>> clientSessionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(clientSessionsMutex);
+        clientSessionsSnapshot = clientSessions;
+    }
+    for (auto session : clientSessionsSnapshot)
+    {
+        try
+        {
+            boost::asio::co_spawn(
+                session->stream_.get_executor(), // Use the executor from the stream
+                [self = session, messege]() -> boost::asio::awaitable<void> {
+                    try {
+                        co_await write_message(self->stream_, messege);
+                    }
+                    catch (const std::exception& e) {
+                        std::cerr << "Error in session: " << e.what() << std::endl;
+                        {
+                            std::lock_guard<std::mutex> lock(clientSessionsMutex);
+                            clientSessions.erase(self);
+                        }
+                    }
+
+                },
+                boost::asio::detached // Detach the coroutine, it runs independently
+            );
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << e.what() << std::endl;
+        }
+    }
+}
 // The main server class that accepts connections
 class Server {
 public:
     Server(boost::asio::io_context& io_context,
         boost::asio::ssl::context& ssl_ctx, short port)
         : acceptor_(io_context, boost::asio::ip::tcp::endpoint
-        (boost::asio::ip::tcp::v4(), boost::asio::ip::port_type(port))),
+        (boost::asio::ip::tcp::v4(), port)),
         ssl_ctx_(ssl_ctx) {
         // Configure the server's SSL context (certificate and key)
         tls_server_context server_ctx(ssl_ctx_);
@@ -369,8 +424,14 @@ private:
                 boost::asio::ip::tcp::socket socket) {
                     if (!ec) {
                         // Create a new session for the accepted client
-                        std::make_shared<clientSession>
-                            (std::move(socket), ssl_ctx_)->start();
+                        std::shared_ptr<clientSession> session =
+                            std::make_shared<clientSession>
+                            (std::move(socket), ssl_ctx_);
+                        {
+                            std::lock_guard<std::mutex> lock(clientSessionsMutex);
+                            clientSessions.insert(session);
+                        }
+                        session->start();
                     }
                     else {
                         std::cerr << "Accept error: " << ec.message() << std::endl;
