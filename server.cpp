@@ -14,6 +14,8 @@
 
 #include "database.h"
 #include "socketHelperFunctions.hpp"
+#include "log.h"
+
 
 using namespace std;
 using namespace boost::asio;
@@ -447,7 +449,47 @@ private:
 
 int main() {
     try {
+        {
+            LogSystem::init(spdlog::level::info);
+            // Get loggers
+            auto default_logger = LogSystem::get_default();
+            auto network_logger = LogSystem::get("network");
+            auto db_logger = LogSystem::get("database");
+            auto unknown_logger = LogSystem::get("nonexistent"); // Will be nullptr
 
+            // --- Using the default logger ---
+            SPDLOG_INFO("Server application started."); // Uses the default logger
+
+            // --- Using named loggers ---
+            if (network_logger) {
+                network_logger->trace("Starting network thread..."); // Will NOT appear in network.log (level is debug)
+                network_logger->debug("Network connection established to {}", "192.168.1.100"); // Will appear in network.log (level is trace)
+                network_logger->info("Received data packet.");
+                network_logger->warn("High latency detected on network interface.");
+            }
+            else {
+                std::cerr << "Error: Network logger not found!" << std::endl;
+            }
+
+            if (db_logger) {
+                db_logger->debug("Executing database query: SELECT * FROM users;"); // Will appear in database.log (level is debug)
+                db_logger->info("User 'admin' logged in successfully.");
+                db_logger->error("Database connection failed!"); // Will appear in both console and database.log
+            }
+            else {
+                std::cerr << "Error: Database logger not found!" << std::endl;
+            }
+
+            if (unknown_logger) {
+                // This block won't execute as unknown_logger is nullptr
+                unknown_logger->info("This should never be logged.");
+            }
+            else {
+                // This is expected
+                std::cout << "As expected, 'nonexistent' logger returned nullptr." << std::endl;
+            }
+            LogSystem::shutdown();
+        }
         boost::asio::io_context io_context;
 
         // Create an SSL context for the server.
@@ -483,6 +525,7 @@ int main() {
         for (auto& t : threads) {
             t.join();
         }
+        //shutdown_logging();
     }
     catch (const std::exception& e) {
         std::cerr << "Server exception: " << e.what() << std::endl;

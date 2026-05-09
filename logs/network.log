@@ -1,0 +1,4 @@
+[2026-04-08 13:24:13.976] [Network] [trace] [thread 1324544] Starting network thread...
+[2026-04-08 13:24:13.976] [Network] [debug] [thread 1324544] Network connection established to 192.168.1.100
+[2026-04-08 13:24:13.976] [Network] [info] [thread 1324544] Received data packet.
+[2026-04-08 13:24:13.976] [Network] [warning] [thread 1324544] High latency detected on network interface.
