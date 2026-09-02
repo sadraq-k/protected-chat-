@@ -1,0 +1,47 @@
+﻿# Visual Studio
+.vs/
+.vscode/
+
+# JetBrains / CLion
+.idea/
+cmake-build-*/
+
+# Build directories
+out/
+build/
+Build/
+bin/
+obj/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled files
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.log
+*~

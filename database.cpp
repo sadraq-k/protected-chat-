@@ -60,16 +60,39 @@ void Database::executeQuery(const std::string& query) {
 
 bool Database::insertUser(const std::string& name, const std::string& username, const std::string& password) {
     std::string hashedPassword = hashPassword(password);
-    std::string sql = "INSERT INTO users (name, username, pwd) VALUES ('" +
-                      name + "', '" + username + "', '" + hashedPassword + "');";
-    try {
-        executeQuery(sql);
-        std::cout << "[DB] User inserted: " << username << std::endl; // لاگ
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Failed to insert user: " << e.what() << std::endl;
+    const char* sql = "INSERT INTO users (name, username, pwd) VALUES (?, ?, ?);";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to insert user: " << sqlite3_errmsg(db) << std::endl;
         return false;
     }
+
+    rc = sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 3, hashedPassword.c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to insert user: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "[ERROR] Failed to insert user: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
+
+    sqlite3_finalize(stmt);
+    std::cout << "[DB] User inserted: " << username << std::endl; // لاگ
+    return true;
 }
 
 bool Database::verifyLogin(const std::string& username, const std::string& password) {
