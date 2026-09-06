@@ -211,7 +211,7 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
 void runServer(const std::string& ip, int port) {
     io_context io;
     try {
-        tcp::acceptor acceptor(io, tcp::endpoint(address::from_string(ip), port));
+        tcp::acceptor acceptor(io, tcp::endpoint(boost::asio::ip::make_address(ip), port));
         std::cout << "[Server] Running on " << ip << ":" << port << std::endl;
         while (true) {
             auto socket = std::make_shared<tcp::socket>(io);
