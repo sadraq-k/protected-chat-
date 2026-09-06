@@ -97,55 +97,137 @@ bool Database::insertUser(const std::string& name, const std::string& username, 
 
 bool Database::verifyLogin(const std::string& username, const std::string& password) {
     std::string hashedPassword = hashPassword(password);
-    std::string sql = "SELECT COUNT(*) FROM users WHERE username = '" + username +
-                      "' AND pwd = '" + hashedPassword + "';";
-    sqlite3_stmt* stmt;
+    const char* sql = "SELECT COUNT(*) FROM users WHERE username = ? AND pwd = ?;";
+    sqlite3_stmt* stmt = nullptr;
     std::cout << "[DB] Verifying login for: " << username << std::endl; // لاگ
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
         std::cerr << "[ERROR] SQL prepare error: " << sqlite3_errmsg(db) << std::endl;
         return false;
     }
-    bool result = false;
-    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0) {
-        result = true;
+
+    rc = sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 2, hashedPassword.c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] SQL bind error: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
+
+    rc = sqlite3_step(stmt);
+    bool result = rc == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0;
+
+    if (rc != SQLITE_ROW) {
+        std::cerr << "[ERROR] Login query failed: " << sqlite3_errmsg(db) << std::endl;
+    } else if (result) {
         std::cout << "[DB] Login verified: " << username << std::endl; // لاگ
     } else {
         std::cout << "[DB] Login failed: " << username << std::endl; // لاگ
     }
+
     sqlite3_finalize(stmt);
     return result;
 }
 
 void Database::storeOfflineMessages(const std::string& sender, const std::string& receiver, const std::string& message) {
-    std::string sql = "INSERT INTO messages (sender, receiver, message) VALUES ('" +
-                      sender + "', '" + receiver + "', '" + message + "');";
-    executeQuery(sql);
+    const char* sql = "INSERT INTO messages (sender, receiver, message) VALUES (?, ?, ?);";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to store offline message: " << sqlite3_errmsg(db) << std::endl;
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    rc = sqlite3_bind_text(stmt, 1, sender.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 2, receiver.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 3, message.c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to store offline message: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "[ERROR] Failed to store offline message: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    sqlite3_finalize(stmt);
     std::cout << "[DB] Stored offline message from " << sender << " to " << receiver << std::endl; // لاگ
 }
 
 std::vector<Message> Database::getOfflineMessages(const std::string& username) {
     std::vector<Message> messages;
-    std::string sql = "SELECT sender, receiver, message FROM messages WHERE receiver = '" + username + "';";
-    sqlite3_stmt* stmt;
+    const char* sql = "SELECT sender, receiver, message FROM messages WHERE receiver = ?;";
+    sqlite3_stmt* stmt = nullptr;
     std::cout << "[DB] Fetching offline messages for: " << username << std::endl; // لاگ
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
         std::cerr << "[ERROR] SQL prepare error: " << sqlite3_errmsg(db) << std::endl;
         return messages;
     }
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+
+    rc = sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] SQL bind error: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        return messages;
+    }
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         Message msg;
         msg.sender = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         msg.receiver = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         msg.message = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
         messages.push_back(msg);
     }
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "[ERROR] Offline message query failed: " << sqlite3_errmsg(db) << std::endl;
+    }
+
     sqlite3_finalize(stmt);
     std::cout << "[DB] Fetched " << messages.size() << " offline messages" << std::endl; // لاگ
     return messages;
 }
 
 void Database::clearOfflineMessages(const std::string& username) {
-    std::string sql = "DELETE FROM messages WHERE receiver = '" + username + "';";
-    executeQuery(sql);
+    const char* sql = "DELETE FROM messages WHERE receiver = ?;";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to clear offline messages: " << sqlite3_errmsg(db) << std::endl;
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    rc = sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        std::cerr << "[ERROR] Failed to clear offline messages: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "[ERROR] Failed to clear offline messages: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("SQL execution failed");
+    }
+
+    sqlite3_finalize(stmt);
     std::cout << "[DB] Cleared offline messages for: " << username << std::endl; // لاگ
 }

@@ -21,6 +21,8 @@ Makefile
 compile_commands.json
 
 # Compiled files
+/server
+/client
 *.exe
 *.dll
 *.so
@@ -33,6 +35,8 @@ compile_commands.json
 # Local databases
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -45,3 +49,4 @@ desktop.ini
 *.tmp
 *.log
 *~
+/proj_in_1file.md
