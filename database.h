@@ -2,11 +2,12 @@
 #define DATABASE_H
 
 #include <sqlite3.h>
+#include <iomanip>
+#include <mutex>
+#include <openssl/sha.h>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <openssl/sha.h>
-#include <iomanip>
-#include <sstream>
 
 struct Message {
     std::string sender;
@@ -14,10 +15,18 @@ struct Message {
     std::string message;
 };
 
+enum class RegistrationResult {
+    Created,
+    DuplicateUsername
+};
+
 class Database {
 private:
     sqlite3* db;
+    // Public operations hold this mutex for their complete SQLite interaction.
+    std::mutex databaseMutex;
 
+    // Used only during construction, before the Database can be shared.
     void executeQuery(const std::string& query);
 
     std::string hashPassword(const std::string& password) {
@@ -32,9 +41,15 @@ private:
 
 public:
     Database(const std::string& dbname);
-    ~Database();
+    // Callers must finish using the object before destruction begins.
+    ~Database() noexcept;
 
-    bool insertUser(const std::string& name, const std::string& username, const std::string& password);
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+    Database(Database&&) = delete;
+    Database& operator=(Database&&) = delete;
+
+    RegistrationResult insertUser(const std::string& name, const std::string& username, const std::string& password);
     bool verifyLogin(const std::string& username, const std::string& password);
     void storeOfflineMessages(const std::string& sender, const std::string& receiver, const std::string& message);
     std::vector<Message> getOfflineMessages(const std::string& username);

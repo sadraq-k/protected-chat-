@@ -107,7 +107,15 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
                 std::cout << "[SIGN_IN] Failed: Missing fields" << std::endl; // لاگ
                 return;
             }
-            if (db.insertUser(name, username_temp, password)) {
+            RegistrationResult registrationResult;
+            try {
+                registrationResult = db.insertUser(name, username_temp, password);
+            } catch (const std::runtime_error& e) {
+                std::cerr << "[ERROR] Registration database failure: " << e.what() << std::endl;
+                sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+                return;
+            }
+            if (registrationResult == RegistrationResult::Created) {
                 sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
                 std::cout << "[SIGN_IN] Success: " << username_temp << std::endl; // لاگ
                 username = username_temp;
@@ -125,7 +133,15 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
                 std::cout << "[LOG_IN] Failed: Missing fields" << std::endl; // لاگ
                 return;
             }
-            if (db.verifyLogin(username_temp, password)) { // اصلاح نام تابع
+            bool loginVerified;
+            try {
+                loginVerified = db.verifyLogin(username_temp, password);
+            } catch (const std::runtime_error& e) {
+                std::cerr << "[ERROR] Login database failure: " << e.what() << std::endl;
+                sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+                return;
+            }
+            if (loginVerified) {
                 sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
                 std::cout << "[LOG_IN] Success: " << username_temp << std::endl; // لاگ
                 username = username_temp;
@@ -151,12 +167,25 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
             std::cout << "[CLIENT] Registered client: " << username << std::endl; // لاگ
         }
 
-        auto messages = db.getOfflineMessages(username);
+        std::vector<Message> messages;
+        try {
+            messages = db.getOfflineMessages(username);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[ERROR] Offline message fetch database failure: " << e.what() << std::endl;
+            sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+            throw;
+        }
         for (const auto& msg : messages) {
             json response = {{"type", "MESSAGE"}, {"sender", msg.sender}, {"content", msg.message}};
             sendResponse(socket, response);
         }
-        db.clearOfflineMessages(username);
+        try {
+            db.clearOfflineMessages(username);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[ERROR] Offline message clear database failure: " << e.what() << std::endl;
+            sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+            throw;
+        }
 
         while (socket->is_open()) {
             json message = receiveData(*socket);
@@ -168,8 +197,13 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
                 std::string receiver = message.value("receiver", "");
                 std::string content = message.value("content", "");
                 if (!receiver.empty() && !content.empty()) {
-                    sendMessageToUser(username, receiver, content);
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Private message sent"}});
+                    try {
+                        sendMessageToUser(username, receiver, content);
+                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Private message sent"}});
+                    } catch (const std::runtime_error& e) {
+                        std::cerr << "[ERROR] Private message database failure: " << e.what() << std::endl;
+                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+                    }
                 } else {
                     sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid private message format"}});
                 }
@@ -180,18 +214,28 @@ void handleClient(std::shared_ptr<tcp::socket> socket) {
                 }
                 std::string content = message.value("content", "");
                 if (!receivers.empty() && !content.empty()) {
-                    for (const auto& receiver : receivers) {
-                        sendMessageToUser(username, receiver, content);
+                    try {
+                        for (const auto& receiver : receivers) {
+                            sendMessageToUser(username, receiver, content);
+                        }
+                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Group message sent"}});
+                    } catch (const std::runtime_error& e) {
+                        std::cerr << "[ERROR] Group message database failure: " << e.what() << std::endl;
+                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
                     }
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Group message sent"}});
                 } else {
                     sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid group message format"}});
                 }
             } else {
                 std::string content = message.value("content", "");
                 if (!content.empty()) {
-                    broadcastMessage(username, content);
-                    sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Broadcast message sent"}});
+                    try {
+                        broadcastMessage(username, content);
+                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Broadcast message sent"}});
+                    } catch (const std::runtime_error& e) {
+                        std::cerr << "[ERROR] Broadcast database failure: " << e.what() << std::endl;
+                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
+                    }
                 } else {
                     sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid broadcast message format"}});
                 }

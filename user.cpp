@@ -196,7 +196,7 @@ void runClient(const std::string& host, const std::string& port) {
 
 int main() {
     try {
-        runClient("127.0.0.1", "1403");
+        runClient("194.9.56.182", "1403");
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Client error: " << e.what() << std::endl;
         return 1;
