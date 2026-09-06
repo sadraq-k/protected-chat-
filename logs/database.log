@@ -1,3 +1,0 @@
-[2026-04-08 13:24:13.976] [Database] [debug] [thread 1324544] Executing database query: SELECT * FROM users;
-[2026-04-08 13:24:13.976] [Database] [info] [thread 1324544] User 'admin' logged in successfully.
-[2026-04-08 13:24:13.976] [Database] [error] [thread 1324544] Database connection failed!
