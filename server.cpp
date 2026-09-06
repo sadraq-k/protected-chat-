@@ -1,277 +1,589 @@
+#include "client_session.h"
+#include "database.h"
+#include "session_registry.h"
+
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
-#include <unordered_map>
-#include <thread>
-#include <mutex>
-#include <memory>
-#include <sstream>
-#include <vector>
+
+#include <cctype>
+#include <condition_variable>
 #include <iostream>
-#include "database.h"
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
-using namespace std;
-using namespace boost::asio;
-using namespace boost::asio::ip;
 using json = nlohmann::json;
+using boost::asio::ip::tcp;
 
-std::mutex mtx;
-std::unordered_map<std::string, std::shared_ptr<tcp::socket>> clients;
-Database db("chat.db");
+#ifndef PROTECTED_CHAT_SERVER_PORT
+#define PROTECTED_CHAT_SERVER_PORT 1403
+#endif
 
-void sendResponse(std::shared_ptr<tcp::socket> socket, const json& response) {
-    if (!socket || !socket->is_open()) {
-        std::cerr << "[ERROR] Socket is closed or invalid" << std::endl;
-        return;
-    }
-    try {
-        std::string data = response.dump() + "\n";
-        std::cout << "[SEND] Sending response: " << data; // لاگ
-        boost::asio::write(*socket, boost::asio::buffer(data));
-        std::cout << "[SEND] Response sent successfully" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Failed to send response: " << e.what() << std::endl;
-    }
-}
+namespace {
 
-json receiveData(tcp::socket& socket) {
-    if (!socket.is_open()) {
-        throw std::runtime_error("Socket is closed");
-    }
-    try {
-        boost::asio::streambuf buf;
-        boost::asio::read_until(socket, buf, "\n");
-        std::istream is(&buf);
-        std::string line;
-        std::getline(is, line);
-        std::cout << "[RECEIVE] Raw data: " << line << std::endl; // لاگ
-        if (line.empty()) {
-            throw std::runtime_error("Empty message received");
+enum class RequestReadResult {
+    Request,
+    InvalidCompleteFrame,
+    TooLarge,
+    Closed
+};
+
+enum class DeliveryResult {
+    Delivered,
+    StoredOffline,
+    Failed
+};
+
+class HandlerTracker {
+public:
+    bool add(const std::shared_ptr<ClientSession>& session) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stopping) {
+            return false;
         }
-        return json::parse(line);
-    } catch (const json::parse_error& e) {
-        std::cerr << "[ERROR] Invalid JSON: " << e.what() << std::endl;
-        throw;
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Receive error: " << e.what() << std::endl;
-        throw;
+        sessions.insert(session);
+        return true;
     }
-}
 
-void sendMessageToUser(const std::string& sender, const std::string& receiver, const std::string& message) {
-    std::lock_guard<std::mutex> lock(mtx);
-    auto it = clients.find(receiver);
-    json response = {{"type", "MESSAGE"}, {"sender", sender}, {"content", message}};
-    if (it != clients.end() && it->second && it->second->is_open()) {
-        std::cout << "[MESSAGE] Sending to " << receiver << std::endl; // لاگ
-        sendResponse(it->second, response);
-    } else {
-        std::cout << "[MESSAGE] Storing offline message for " << receiver << std::endl; // لاگ
-        db.storeOfflineMessages(sender, receiver, message); // اصلاح نام تابع
-    }
-}
-
-void broadcastMessage(const std::string& sender, const std::string& message) {
-    std::lock_guard<std::mutex> lock(mtx);
-    json response = {{"type", "MESSAGE"}, {"sender", sender}, {"content", message}};
-    for (auto it = clients.begin(); it != clients.end();) {
-        if (it->first != sender) {
-            if (it->second && it->second->is_open()) {
-                sendResponse(it->second, response);
-                ++it;
-            } else {
-                db.storeOfflineMessages(sender, it->first, message); // اصلاح نام تابع
-                it = clients.erase(it);
-            }
-        } else {
-            ++it;
+    void complete(const std::shared_ptr<ClientSession>& session) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        sessions.erase(session);
+        if (sessions.empty()) {
+            completed.notify_all();
         }
     }
+
+    void stopAllAndWait() noexcept {
+        std::vector<std::shared_ptr<ClientSession>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            snapshot.assign(sessions.begin(), sessions.end());
+        }
+
+        for (const std::shared_ptr<ClientSession>& session : snapshot) {
+            session->requestStop();
+        }
+
+        std::unique_lock<std::mutex> lock(mutex);
+        completed.wait(lock, [this] { return sessions.empty(); });
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable completed;
+    std::unordered_set<std::shared_ptr<ClientSession>> sessions;
+    bool stopping = false;
+};
+
+bool isWhitespaceOnly(const std::string& text) {
+    for (const unsigned char character : text) {
+        if (!std::isspace(character)) {
+            return false;
+        }
+    }
+    return true;
 }
 
-void handleClient(std::shared_ptr<tcp::socket> socket) {
+bool readNonEmptyString(
+    const json& request,
+    const char* field,
+    std::string& value) {
+    const auto found = request.find(field);
+    if (found == request.end() || !found->is_string()) {
+        return false;
+    }
+    value = found->get<std::string>();
+    return !value.empty();
+}
+
+RequestReadResult readJsonRequest(
+    const std::shared_ptr<ClientSession>& session,
+    json& request) {
+    std::string frame;
+    const FrameReadResult frameResult = session->readFrame(frame);
+    if (frameResult == FrameReadResult::TooLarge) {
+        return RequestReadResult::TooLarge;
+    }
+    if (frameResult != FrameReadResult::Frame) {
+        if (frameResult == FrameReadResult::IncompleteFrame) {
+            std::cerr << "[CONNECTION] EOF during an incomplete frame" << std::endl;
+        } else if (frameResult == FrameReadResult::TransportFailure &&
+                   !session->isStopping()) {
+            std::cerr << "[CONNECTION] Read failure" << std::endl;
+        }
+        return RequestReadResult::Closed;
+    }
+
+    if (frame.empty() || isWhitespaceOnly(frame)) {
+        return RequestReadResult::InvalidCompleteFrame;
+    }
+
+    request = json::parse(frame, nullptr, false);
+    if (request.is_discarded()) {
+        return RequestReadResult::InvalidCompleteFrame;
+    }
+    return RequestReadResult::Request;
+}
+
+bool sendFailure(
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& message) {
+    return session->sendJson({{"status", "FAIL"}, {"message", message}}) ==
+        SendResult::Written;
+}
+
+bool authenticate(
+    const std::shared_ptr<ClientSession>& session,
+    Database& database,
+    SessionRegistry& registry) {
+    json request;
+    const RequestReadResult readResult = readJsonRequest(session, request);
+    if (readResult == RequestReadResult::TooLarge) {
+        sendFailure(session, "Frame too large");
+        session->requestStop();
+        return false;
+    }
+    if (readResult == RequestReadResult::InvalidCompleteFrame) {
+        std::cout << "[AUTH] Invalid authentication frame" << std::endl;
+        sendFailure(session, "Invalid authentication request");
+        return false;
+    }
+    if (readResult == RequestReadResult::Closed) {
+        return false;
+    }
+    if (!request.is_object()) {
+        sendFailure(session, "Invalid authentication request");
+        return false;
+    }
+
+    std::string action;
+    if (!readNonEmptyString(request, "action", action)) {
+        sendFailure(session, "Invalid authentication request");
+        return false;
+    }
+
     std::string username;
-    try {
-        std::cout << "[CLIENT] New client connected" << std::endl; // لاگ
-        json request = receiveData(*socket);
-        std::cout << "[CLIENT] Request: " << request.dump() << std::endl; // لاگ
-        std::string action = request.value("action", "");
-        std::cout << "[CLIENT] Action: " << action << std::endl; // لاگ
+    std::string password;
+    if (action == "SIGN_IN") {
+        std::string name;
+        if (!readNonEmptyString(request, "name", name) ||
+            !readNonEmptyString(request, "username", username) ||
+            !readNonEmptyString(request, "password", password)) {
+            sendFailure(session, "All fields are required");
+            return false;
+        }
 
-        if (action == "SIGN_IN") {
-            std::string name = request.value("name", "");
-            std::string username_temp = request.value("username", "");
-            std::string password = request.value("password", "");
-            std::cout << "[SIGN_IN] Attempt: name=" << name << ", username=" << username_temp << std::endl; // لاگ
-            if (name.empty() || username_temp.empty() || password.empty()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "All fields are required"}});
-                std::cout << "[SIGN_IN] Failed: Missing fields" << std::endl; // لاگ
-                return;
+        std::cout << "[AUTH] Registration attempted for: " << username << std::endl;
+        try {
+            const RegistrationResult result =
+                database.insertUser(name, username, password);
+            if (result == RegistrationResult::DuplicateUsername) {
+                std::cout << "[AUTH] Registration rejected: duplicate username" << std::endl;
+                sendFailure(session, "Username exists");
+                return false;
             }
-            RegistrationResult registrationResult;
-            try {
-                registrationResult = db.insertUser(name, username_temp, password);
-            } catch (const std::runtime_error& e) {
-                std::cerr << "[ERROR] Registration database failure: " << e.what() << std::endl;
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-                return;
+        } catch (const std::runtime_error& error) {
+            std::cerr << "[AUTH] Registration database failure: "
+                      << error.what() << std::endl;
+            sendFailure(session, "Database error");
+            return false;
+        }
+    } else if (action == "LOG_IN") {
+        if (!readNonEmptyString(request, "username", username) ||
+            !readNonEmptyString(request, "password", password)) {
+            sendFailure(session, "Username and password required");
+            return false;
+        }
+
+        std::cout << "[AUTH] Login attempted for: " << username << std::endl;
+        try {
+            if (!database.verifyLogin(username, password)) {
+                std::cout << "[AUTH] Login rejected: invalid credentials" << std::endl;
+                sendFailure(session, "Invalid credentials");
+                return false;
             }
-            if (registrationResult == RegistrationResult::Created) {
-                sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
-                std::cout << "[SIGN_IN] Success: " << username_temp << std::endl; // لاگ
-                username = username_temp;
-            } else {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Username exists"}});
-                std::cout << "[SIGN_IN] Failed: Username exists" << std::endl; // لاگ
-                return;
+        } catch (const std::runtime_error& error) {
+            std::cerr << "[AUTH] Login database failure: "
+                      << error.what() << std::endl;
+            sendFailure(session, "Database error");
+            return false;
+        }
+    } else {
+        sendFailure(session, "Invalid action");
+        return false;
+    }
+
+    session->setAuthenticatedUsername(username);
+    if (!registry.reserve(username, session)) {
+        std::cout << "[AUTH] Admission rejected: user already logged in" << std::endl;
+        sendFailure(session, "User already logged in");
+        return false;
+    }
+
+    const json success = {
+        {"status", "SUCCESS"},
+        {"message", "Your ID: " + username}
+    };
+    if (session->sendJson(success) != SendResult::Written) {
+        registry.removeIfSame(username, session);
+        return false;
+    }
+    if (!registry.publishReady(username, session)) {
+        registry.removeIfSame(username, session);
+        return false;
+    }
+
+    std::cout << "[AUTH] Session admitted for: " << username << std::endl;
+    return true;
+}
+
+DeliveryResult sendMessageToUser(
+    const std::string& sender,
+    const std::string& receiver,
+    const std::string& content,
+    Database& database,
+    SessionRegistry& registry) {
+    const std::shared_ptr<ClientSession> target = registry.findReady(receiver);
+    if (!target) {
+        database.storeOfflineMessages(sender, receiver, content);
+        return DeliveryResult::StoredOffline;
+    }
+
+    const json response = {
+        {"type", "MESSAGE"},
+        {"sender", sender},
+        {"content", content}
+    };
+    if (target->sendJson(response) == SendResult::Written) {
+        return DeliveryResult::Delivered;
+    }
+
+    target->requestStop();
+    registry.removeIfSame(receiver, target);
+    return DeliveryResult::Failed;
+}
+
+bool broadcastMessage(
+    const std::string& sender,
+    const std::string& content,
+    SessionRegistry& registry) {
+    const auto targets = registry.snapshotReadyExcept(sender);
+    const json response = {
+        {"type", "MESSAGE"},
+        {"sender", sender},
+        {"content", content}
+    };
+
+    bool allWritten = true;
+    for (const auto& target : targets) {
+        if (target.second->sendJson(response) == SendResult::Written) {
+            continue;
+        }
+        allWritten = false;
+        target.second->requestStop();
+        registry.removeIfSame(target.first, target.second);
+    }
+    return allWritten;
+}
+
+bool replayOfflineMessages(
+    const std::shared_ptr<ClientSession>& session,
+    Database& database) {
+    std::vector<Message> messages;
+    try {
+        messages = database.getOfflineMessages(session->authenticatedUsername());
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[OFFLINE] Fetch database failure: "
+                  << error.what() << std::endl;
+        sendFailure(session, "Database error");
+        return false;
+    }
+
+    for (const Message& message : messages) {
+        const json response = {
+            {"type", "MESSAGE"},
+            {"sender", message.sender},
+            {"content", message.message}
+        };
+        if (session->sendJson(response) != SendResult::Written) {
+            return false;
+        }
+    }
+
+    try {
+        database.clearOfflineMessages(session->authenticatedUsername());
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[OFFLINE] Clear database failure: "
+                  << error.what() << std::endl;
+        sendFailure(session, "Database error");
+        return false;
+    }
+    return true;
+}
+
+bool sendOperationResult(
+    const std::shared_ptr<ClientSession>& session,
+    bool success,
+    const std::string& successMessage,
+    const std::string& failureMessage) {
+    const json response = {
+        {"status", success ? "SUCCESS" : "FAIL"},
+        {"message", success ? successMessage : failureMessage}
+    };
+    return session->sendJson(response) == SendResult::Written;
+}
+
+bool processPrivateMessage(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& sender,
+    Database& database,
+    SessionRegistry& registry) {
+    std::string receiver;
+    std::string content;
+    if (!readNonEmptyString(request, "receiver", receiver) ||
+        !readNonEmptyString(request, "content", content)) {
+        return sendFailure(session, "Invalid private message format");
+    }
+
+    try {
+        const DeliveryResult result =
+            sendMessageToUser(sender, receiver, content, database, registry);
+        return sendOperationResult(
+            session,
+            result != DeliveryResult::Failed,
+            "Private message sent",
+            "Message delivery failed");
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[MESSAGE] Private database failure: "
+                  << error.what() << std::endl;
+        return sendFailure(session, "Database error");
+    }
+}
+
+bool processGroupMessage(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& sender,
+    Database& database,
+    SessionRegistry& registry) {
+    std::string content;
+    const auto receivers = request.find("receivers");
+    if (!readNonEmptyString(request, "content", content) ||
+        receivers == request.end() ||
+        !receivers->is_array() ||
+        receivers->empty()) {
+        return sendFailure(session, "Invalid group message format");
+    }
+
+    std::vector<std::string> validatedReceivers;
+    for (const json& receiver : *receivers) {
+        if (!receiver.is_string()) {
+            return sendFailure(session, "Invalid group message format");
+        }
+        std::string value = receiver.get<std::string>();
+        if (value.empty()) {
+            return sendFailure(session, "Invalid group message format");
+        }
+        validatedReceivers.push_back(std::move(value));
+    }
+
+    bool allDelivered = true;
+    try {
+        for (const std::string& receiver : validatedReceivers) {
+            if (sendMessageToUser(
+                    sender, receiver, content, database, registry) ==
+                DeliveryResult::Failed) {
+                allDelivered = false;
+                break;
             }
-        } else if (action == "LOG_IN") {
-            std::string username_temp = request.value("username", "");
-            std::string password = request.value("password", "");
-            std::cout << "[LOG_IN] Attempt: username=" << username_temp << std::endl; // لاگ
-            if (username_temp.empty() || password.empty()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Username and password required"}});
-                std::cout << "[LOG_IN] Failed: Missing fields" << std::endl; // لاگ
-                return;
-            }
-            bool loginVerified;
-            try {
-                loginVerified = db.verifyLogin(username_temp, password);
-            } catch (const std::runtime_error& e) {
-                std::cerr << "[ERROR] Login database failure: " << e.what() << std::endl;
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-                return;
-            }
-            if (loginVerified) {
-                sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Your ID: " + username_temp}});
-                std::cout << "[LOG_IN] Success: " << username_temp << std::endl; // لاگ
-                username = username_temp;
-            } else {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid credentials"}});
-                std::cout << "[LOG_IN] Failed: Invalid credentials" << std::endl; // لاگ
-                return;
-            }
-        } else {
-            sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid action"}});
-            std::cout << "[CLIENT] Invalid action: " << action << std::endl; // لاگ
+        }
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[MESSAGE] Group database failure: "
+                  << error.what() << std::endl;
+        return sendFailure(session, "Database error");
+    }
+
+    return sendOperationResult(
+        session,
+        allDelivered,
+        "Group message sent",
+        "Message delivery failed");
+}
+
+bool processBroadcastMessage(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& sender,
+    SessionRegistry& registry) {
+    std::string content;
+    if (!readNonEmptyString(request, "content", content)) {
+        return sendFailure(session, "Invalid broadcast message format");
+    }
+
+    return sendOperationResult(
+        session,
+        broadcastMessage(sender, content, registry),
+        "Broadcast message sent",
+        "Message delivery failed");
+}
+
+void processMessages(
+    const std::shared_ptr<ClientSession>& session,
+    Database& database,
+    SessionRegistry& registry) {
+    const std::string& sender = session->authenticatedUsername();
+
+    while (!session->isStopping()) {
+        json request;
+        const RequestReadResult readResult = readJsonRequest(session, request);
+        if (readResult == RequestReadResult::TooLarge) {
+            sendFailure(session, "Frame too large");
+            session->requestStop();
             return;
         }
-
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            if (clients.find(username) != clients.end()) {
-                sendResponse(socket, {{"status", "FAIL"}, {"message", "User already logged in"}});
-                std::cout << "[CLIENT] Failed: " << username << " already logged in" << std::endl; // لاگ
+        if (readResult == RequestReadResult::InvalidCompleteFrame) {
+            if (!sendFailure(session, "Invalid request")) {
                 return;
             }
-            clients[username] = socket;
-            std::cout << "[CLIENT] Registered client: " << username << std::endl; // لاگ
+            continue;
         }
-
-        std::vector<Message> messages;
-        try {
-            messages = db.getOfflineMessages(username);
-        } catch (const std::runtime_error& e) {
-            std::cerr << "[ERROR] Offline message fetch database failure: " << e.what() << std::endl;
-            sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-            throw;
+        if (readResult == RequestReadResult::Closed) {
+            return;
         }
-        for (const auto& msg : messages) {
-            json response = {{"type", "MESSAGE"}, {"sender", msg.sender}, {"content", msg.message}};
-            sendResponse(socket, response);
-        }
-        try {
-            db.clearOfflineMessages(username);
-        } catch (const std::runtime_error& e) {
-            std::cerr << "[ERROR] Offline message clear database failure: " << e.what() << std::endl;
-            sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-            throw;
-        }
-
-        while (socket->is_open()) {
-            json message = receiveData(*socket);
-            std::string msgType = message.value("type", "");
-            std::cout << "[CLIENT] Message type: " << msgType << std::endl; // لاگ
-            if (msgType == "EXIT") {
-                break;
-            } else if (msgType == "PRIVATE") {
-                std::string receiver = message.value("receiver", "");
-                std::string content = message.value("content", "");
-                if (!receiver.empty() && !content.empty()) {
-                    try {
-                        sendMessageToUser(username, receiver, content);
-                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Private message sent"}});
-                    } catch (const std::runtime_error& e) {
-                        std::cerr << "[ERROR] Private message database failure: " << e.what() << std::endl;
-                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-                    }
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid private message format"}});
-                }
-            } else if (msgType == "GROUP") {
-                std::vector<std::string> receivers;
-                for (const auto& r : message.value("receivers", json::array())) {
-                    receivers.push_back(r.get<std::string>());
-                }
-                std::string content = message.value("content", "");
-                if (!receivers.empty() && !content.empty()) {
-                    try {
-                        for (const auto& receiver : receivers) {
-                            sendMessageToUser(username, receiver, content);
-                        }
-                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Group message sent"}});
-                    } catch (const std::runtime_error& e) {
-                        std::cerr << "[ERROR] Group message database failure: " << e.what() << std::endl;
-                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-                    }
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid group message format"}});
-                }
-            } else {
-                std::string content = message.value("content", "");
-                if (!content.empty()) {
-                    try {
-                        broadcastMessage(username, content);
-                        sendResponse(socket, {{"status", "SUCCESS"}, {"message", "Broadcast message sent"}});
-                    } catch (const std::runtime_error& e) {
-                        std::cerr << "[ERROR] Broadcast database failure: " << e.what() << std::endl;
-                        sendResponse(socket, {{"status", "FAIL"}, {"message", "Database error"}});
-                    }
-                } else {
-                    sendResponse(socket, {{"status", "FAIL"}, {"message", "Invalid broadcast message format"}});
-                }
+        if (!request.is_object()) {
+            if (!sendFailure(session, "Invalid request")) {
+                return;
             }
+            continue;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Client " << username << " error: " << e.what() << std::endl;
+
+        std::string type;
+        if (!readNonEmptyString(request, "type", type)) {
+            if (!sendFailure(session, "Invalid message type")) {
+                return;
+            }
+            continue;
+        }
+
+        if (type == "EXIT") {
+            return;
+        }
+        if (type == "PRIVATE") {
+            if (!processPrivateMessage(
+                    request, session, sender, database, registry)) {
+                return;
+            }
+            continue;
+        }
+        if (type == "GROUP") {
+            if (!processGroupMessage(
+                    request, session, sender, database, registry)) {
+                return;
+            }
+            continue;
+        }
+        if (type == "BROADCAST") {
+            if (!processBroadcastMessage(request, session, sender, registry)) {
+                return;
+            }
+            continue;
+        }
+
+        if (!sendFailure(session, "Invalid message type")) {
+            return;
+        }
     }
-    std::lock_guard<std::mutex> lock(mtx);
-    clients.erase(username);
-    if (socket->is_open()) {
-        socket->close();
-    }
-    std::cout << "[CLIENT] Disconnected: " << username << std::endl;
 }
 
-void runServer(const std::string& ip, int port) {
-    io_context io;
-    try {
-        tcp::acceptor acceptor(io, tcp::endpoint(boost::asio::ip::make_address(ip), port));
-        std::cout << "[Server] Running on " << ip << ":" << port << std::endl;
-        while (true) {
-            auto socket = std::make_shared<tcp::socket>(io);
-            acceptor.accept(*socket);
-            std::thread(handleClient, socket).detach();
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Server error: " << e.what() << std::endl;
+void cleanupSession(
+    const std::shared_ptr<ClientSession>& session,
+    SessionRegistry& registry,
+    HandlerTracker& handlers) noexcept {
+    session->requestStop();
+    const std::string& username = session->authenticatedUsername();
+    if (!username.empty()) {
+        registry.removeIfSame(username, session);
     }
+    session->close();
+    handlers.complete(session);
+    std::cout << "[CONNECTION] Session closed"
+              << (username.empty() ? "" : ": " + username) << std::endl;
+}
+
+void handleClient(
+    const std::shared_ptr<ClientSession>& session,
+    Database& database,
+    SessionRegistry& registry,
+    HandlerTracker& handlers) noexcept {
+    try {
+        std::cout << "[CONNECTION] Client connected" << std::endl;
+        if (authenticate(session, database, registry) &&
+            replayOfflineMessages(session, database)) {
+            processMessages(session, database, registry);
+        }
+    } catch (...) {
+        std::cerr << "[CONNECTION] Unexpected session failure" << std::endl;
+    }
+    cleanupSession(session, registry, handlers);
+}
+
+} // namespace
+
+void runServer(const std::string& ip, int port) {
+    boost::asio::io_context ioContext;
+    Database database("chat.db");
+    SessionRegistry registry;
+    HandlerTracker handlers;
+
+    try {
+        tcp::acceptor acceptor(
+            ioContext,
+            tcp::endpoint(boost::asio::ip::make_address(ip), port));
+        std::cout << "[SERVER] Running on " << ip << ":" << port << std::endl;
+
+        while (true) {
+            const std::shared_ptr<ClientSession> session =
+                std::make_shared<ClientSession>(ioContext);
+            acceptor.accept(session->socketForAccept());
+
+            if (!handlers.add(session)) {
+                session->close();
+                break;
+            }
+
+            try {
+                std::thread(
+                    handleClient,
+                    session,
+                    std::ref(database),
+                    std::ref(registry),
+                    std::ref(handlers))
+                    .detach();
+            } catch (const std::system_error& error) {
+                std::cerr << "[SERVER] Failed to start handler: "
+                          << error.what() << std::endl;
+                session->close();
+                handlers.complete(session);
+            }
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[SERVER] Accept loop stopped: " << error.what() << std::endl;
+    }
+
+    handlers.stopAllAndWait();
 }
 
 int main() {
     try {
-        runServer("127.0.0.1", 1403);
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Server error: " << e.what() << std::endl;
+        runServer("127.0.0.1", PROTECTED_CHAT_SERVER_PORT);
+    } catch (const std::exception& error) {
+        std::cerr << "[SERVER] Startup failure: " << error.what() << std::endl;
         return 1;
     }
     return 0;
