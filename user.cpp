@@ -1,204 +1,340 @@
-#include <boost/asio.hpp>
-#include <nlohmann/json.hpp>
-#include <thread>
-#include <atomic>
-#include <iostream>
-#include <string>
+#include "client_connection.h"
+#include "console_input.h"
 
-using namespace boost::asio;
-using namespace boost::asio::ip;
+#include <nlohmann/json.hpp>
+
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
 using json = nlohmann::json;
 
-std::atomic<bool> running(true);
+#ifndef PROTECTED_CHAT_CLIENT_HOST
+#define PROTECTED_CHAT_CLIENT_HOST "194.9.56.182"
+#endif
 
-void receiveMessages(tcp::socket& socket) {
-    try {
-        while (running && socket.is_open()) {
-            boost::asio::streambuf buf;
-            boost::asio::read_until(socket, buf, "\n");
-            std::istream is(&buf);
-            std::string line;
-            std::getline(is, line);
-            std::cout << "[RECEIVE] Raw message: " << line << std::endl; // لاگ
-            if (line.empty()) {
-                std::cerr << "[ERROR] Empty message received" << std::endl;
-                continue;
-            }
-            try {
-                json message = json::parse(line);
-                std::cout << "[RECEIVE] Parsed message: " << message.dump() << std::endl; // لاگ
-                if (message.value("type", "") == "MESSAGE") {
-                    std::cout << message.value("sender", "") << ": " << message.value("content", "") << std::endl;
-                } else {
-                    std::cout << "Server: " << message.value("message", "") << std::endl;
-                }
-            } catch (const json::parse_error& e) {
-                std::cerr << "[ERROR] Invalid JSON: " << e.what() << std::endl;
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Receive error: " << e.what() << std::endl;
-        running = false;
-        if (socket.is_open()) {
-            socket.close();
-        }
+#ifndef PROTECTED_CHAT_CLIENT_PORT
+#define PROTECTED_CHAT_CLIENT_PORT "1403"
+#endif
+
+namespace {
+
+class ConsoleOutput {
+public:
+    void line(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cout << text << std::endl;
     }
+
+    void error(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cerr << text << std::endl;
+    }
+
+    void prompt(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cout << text << std::flush;
+    }
+
+private:
+    std::mutex mutex;
+};
+
+bool readConsoleLine(
+    ConsoleInput& input,
+    ConsoleOutput& output,
+    ClientConnection& connection,
+    const std::string& prompt,
+    std::string& line) {
+    output.prompt(prompt);
+    const ConsoleReadResult result = input.readLine(line);
+    if (result == ConsoleReadResult::Line) {
+        return true;
+    }
+    if (result == ConsoleReadResult::Interrupted) {
+        return false;
+    }
+    if (result == ConsoleReadResult::EndOfFile) {
+        output.line("[CLIENT] Standard input closed");
+    } else if (result == ConsoleReadResult::TooLong) {
+        output.error("[ERROR] Console input exceeded the 1 MiB limit");
+        connection.requestStop("Console input too long");
+    } else if (result == ConsoleReadResult::Unsupported) {
+        output.error(
+            "[ERROR] Interruptible console input is not implemented on Windows");
+        connection.requestStop("Unsupported console input platform");
+    } else {
+        output.error("[ERROR] Console input failed");
+        connection.requestStop("Console input failed");
+    }
+    return false;
+}
+
+void finishConnection(
+    ClientConnection& connection,
+    const std::string& reason) {
+    connection.requestStop(reason);
+    connection.joinReceiver();
+    connection.close();
+}
+
+bool sendRequest(
+    ClientConnection& connection,
+    ConsoleOutput& output,
+    const json& request,
+    const std::string& label) {
+    const ClientSendResult result = connection.sendJson(request);
+    if (result == ClientSendResult::Written) {
+        output.line("[SEND] " + label + " frame written");
+        return true;
+    }
+    if (result == ClientSendResult::TooLarge) {
+        output.error(
+            "[ERROR] " + label +
+            " exceeds the server's 65,536-byte request limit");
+        return false;
+    }
+    output.error("[ERROR] " + label + " write failed");
+    return false;
+}
+
+bool buildAuthenticationRequest(
+    ConsoleInput& input,
+    ConsoleOutput& output,
+    ClientConnection& connection,
+    json& request) {
+    std::string choice;
+    if (!readConsoleLine(
+            input,
+            output,
+            connection,
+            "Enter 1 for sign in, 2 for log in: ",
+            choice)) {
+        return false;
+    }
+
+    if (choice == "1") {
+        std::string name;
+        std::string username;
+        std::string password;
+        if (!readConsoleLine(
+                input, output, connection, "Enter name: ", name) ||
+            !readConsoleLine(
+                input, output, connection, "Enter username: ", username) ||
+            !readConsoleLine(
+                input, output, connection, "Enter password: ", password)) {
+            return false;
+        }
+        if (name.empty() || username.empty() || password.empty()) {
+            output.error("[ERROR] All fields must be filled");
+            connection.requestStop("Incomplete registration input");
+            return false;
+        }
+        output.line("[AUTH] Registration requested for: " + username);
+        request = {
+            {"action", "SIGN_IN"},
+            {"name", name},
+            {"username", username},
+            {"password", password}
+        };
+        return true;
+    }
+
+    if (choice == "2") {
+        std::string username;
+        std::string password;
+        if (!readConsoleLine(
+                input, output, connection, "Enter username: ", username) ||
+            !readConsoleLine(
+                input, output, connection, "Enter password: ", password)) {
+            return false;
+        }
+        if (username.empty() || password.empty()) {
+            output.error("[ERROR] Username and password required");
+            connection.requestStop("Incomplete login input");
+            return false;
+        }
+        output.line("[AUTH] Login requested for: " + username);
+        request = {
+            {"action", "LOG_IN"},
+            {"username", username},
+            {"password", password}
+        };
+        return true;
+    }
+
+    output.error("[ERROR] Invalid choice");
+    connection.requestStop("Invalid authentication choice");
+    return false;
+}
+
+bool buildMessageRequest(
+    const std::string& input,
+    ConsoleOutput& output,
+    json& message) {
+    if (input.rfind("PRIVATE:", 0) == 0) {
+        std::istringstream stream(input.substr(8));
+        std::string receiver;
+        std::string content;
+        std::getline(stream, receiver, ':');
+        std::getline(stream, content);
+        if (receiver.empty() || content.empty()) {
+            output.error("[ERROR] Invalid private message format");
+            return false;
+        }
+        message = {
+            {"type", "PRIVATE"},
+            {"receiver", receiver},
+            {"content", content}
+        };
+        return true;
+    }
+
+    if (input.rfind("GROUP:", 0) == 0) {
+        std::istringstream stream(input.substr(6));
+        std::string receivers;
+        std::string content;
+        std::getline(stream, receivers, ':');
+        std::getline(stream, content);
+
+        std::vector<std::string> receiverList;
+        std::istringstream receiverStream(receivers);
+        std::string receiver;
+        while (std::getline(receiverStream, receiver, ',')) {
+            receiverList.push_back(receiver);
+        }
+        if (receiverList.empty() || content.empty()) {
+            output.error("[ERROR] Invalid group message format");
+            return false;
+        }
+        message = {
+            {"type", "GROUP"},
+            {"receivers", receiverList},
+            {"content", content}
+        };
+        return true;
+    }
+
+    message = {{"type", "BROADCAST"}, {"content", input}};
+    return true;
 }
 
 void runClient(const std::string& host, const std::string& port) {
-    io_context io;
-    tcp::socket socket(io);
-    tcp::resolver resolver(io);
+    ConsoleInput input;
+    ConsoleOutput output;
+    ClientConnection connection;
+
+    output.line("[CLIENT] Connecting to " + host + ":" + port);
+    try {
+        connection.connect(host, port);
+    } catch (const boost::system::system_error& error) {
+        output.error(
+            "[ERROR] Connection failed: " + error.code().message());
+        return;
+    }
+    output.line("[CLIENT] Connected to server");
 
     try {
-        std::cout << "[CLIENT] Connecting to " << host << ":" << port << std::endl; // لاگ
-        connect(socket, resolver.resolve(host, port));
-        std::cout << "[CLIENT] Connected to server" << std::endl;
-    } catch (const boost::system::system_error& e) {
-        std::cerr << "[ERROR] Connection failed: " << e.what() << " (Code: " << e.code() << ")" << std::endl;
+        connection.startReceiver(
+            [&output](ClientFrameKind kind, const json& message) {
+                if (kind == ClientFrameKind::Message) {
+                    output.line(
+                        message.at("sender").get<std::string>() + ": " +
+                        message.at("content").get<std::string>());
+                } else {
+                    output.line(
+                        "Server [" + message.at("status").get<std::string>() +
+                        "]: " + message.at("message").get<std::string>());
+                }
+            },
+            [&output](const std::string& message, bool error) {
+                if (error) {
+                    output.error("[ERROR] " + message);
+                } else {
+                    output.line("[CLIENT] " + message);
+                }
+            },
+            [&input] { input.interrupt(); });
+    } catch (const std::system_error& error) {
+        output.error(
+            "[ERROR] Could not start receiver: " +
+            std::string(error.what()));
+        finishConnection(connection, "Receiver thread startup failed");
         return;
     }
 
-    std::string choice;
-    std::cout << "Enter 1 for sign in, 2 for log in: ";
-    std::cin >> choice;
-    std::cin.ignore();
+    json authenticationRequest;
+    if (!buildAuthenticationRequest(
+            input, output, connection, authenticationRequest)) {
+        finishConnection(connection, "Authentication input ended");
+        return;
+    }
+    if (!sendRequest(
+            connection,
+            output,
+            authenticationRequest,
+            "Authentication request")) {
+        finishConnection(connection, "Authentication request was not written");
+        return;
+    }
 
-    json request;
-    if (choice == "1") {
-        std::string name, username, password;
-        std::cout << "Enter name: ";
-        std::getline(std::cin, name);
-        std::cout << "Enter username: ";
-        std::getline(std::cin, username);
-        std::cout << "Enter password: ";
-        std::getline(std::cin, password);
-        if (name.empty() || username.empty() || password.empty()) {
-            std::cerr << "[ERROR] All fields must be filled" << std::endl;
-            return;
+    std::string authenticationMessage;
+    const AuthenticationResult authenticationResult =
+        connection.waitForAuthentication(authenticationMessage);
+    if (authenticationResult != AuthenticationResult::Success) {
+        output.line("Authentication failed: " + authenticationMessage);
+        finishConnection(connection, "Authentication did not succeed");
+        return;
+    }
+
+    output.line("Authentication successful! " + authenticationMessage);
+    connection.beginPostAuthentication();
+
+    while (!connection.isStopping()) {
+        std::string command;
+        if (!readConsoleLine(
+                input,
+                output,
+                connection,
+                "Enter message (or 'exit', 'PRIVATE:username:msg', "
+                "'GROUP:user1,user2:msg'): ",
+                command)) {
+            if (connection.isAuthenticated() && !connection.isStopping()) {
+                sendRequest(connection, output, {{"type", "EXIT"}}, "EXIT");
+            }
+            break;
         }
-        request = {{"action", "SIGN_IN"}, {"name", name}, {"username", username}, {"password", password}};
-    } else if (choice == "2") {
-        std::string username, password;
-        std::cout << "Enter username: ";
-        std::getline(std::cin, username);
-        std::cout << "Enter password: ";
-        std::getline(std::cin, password);
-        if (username.empty() || password.empty()) {
-            std::cerr << "[ERROR] Username and password required" << std::endl;
-            return;
+        if (command.empty()) {
+            continue;
         }
-        request = {{"action", "LOG_IN"}, {"username", username}, {"password", password}};
-    } else {
-        std::cout << "[ERROR] Invalid choice" << std::endl;
-        return;
-    }
-
-    try {
-        std::cout << "[SEND] Sending request: " << request.dump() << std::endl; // لاگ
-        boost::asio::write(socket, boost::asio::buffer(request.dump() + "\n"));
-        std::cout << "[SEND] Request sent" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Send error: " << e.what() << std::endl;
-        return;
-    }
-
-    boost::asio::streambuf buf;
-    try {
-        boost::asio::read_until(socket, buf, "\n");
-        std::cout << "[RECEIVE] Response received" << std::endl; // لاگ
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Receive response error: " << e.what() << std::endl;
-        return;
-    }
-
-    std::istream is(&buf);
-    std::string response_str;
-    std::getline(is, response_str);
-    std::cout << "[RECEIVE] Raw response: " << response_str << std::endl; // لاگ
-    json response;
-    try {
-        response = json::parse(response_str);
-        std::cout << "[RECEIVE] Parsed response: " << response.dump() << std::endl; // لاگ
-    } catch (const json::parse_error& e) {
-        std::cerr << "[ERROR] Invalid response JSON: " << e.what() << std::endl;
-        return;
-    }
-
-    if (response.value("status", "") != "SUCCESS") {
-        std::cout << "Authentication failed: " << response.value("message", "") << std::endl;
-        if (socket.is_open()) {
-            socket.close();
+        if (command == "exit") {
+            sendRequest(connection, output, {{"type", "EXIT"}}, "EXIT");
+            break;
         }
-        return;
-    }
-    std::cout << "Authentication successful! " << response.value("message", "") << std::endl;
-
-    std::thread receiveThread(receiveMessages, std::ref(socket));
-    while (running && socket.is_open()) {
-        std::string input;
-        std::cout << "Enter message (or 'exit', 'PRIVATE:username:msg', 'GROUP:user1,user2:msg'): ";
-        std::getline(std::cin, input);
-
-        if (input.empty()) continue;
 
         json message;
-        if (input == "exit") {
-            message = {{"type", "EXIT"}};
-            running = false;
-        } else if (input.find("PRIVATE:") == 0) {
-            std::istringstream iss(input.substr(8));
-            std::string receiver, content;
-            std::getline(iss, receiver, ':');
-            std::getline(iss, content);
-            if (!receiver.empty() && !content.empty()) {
-                message = {{"type", "PRIVATE"}, {"receiver", receiver}, {"content", content}};
-            } else {
-                std::cout << "[ERROR] Invalid private message format" << std::endl;
-                continue;
-            }
-        } else if (input.find("GROUP:") == 0) {
-            std::istringstream iss(input.substr(6));
-            std::string receivers, content;
-            std::getline(iss, receivers, ':');
-            std::getline(iss, content);
-            std::vector<std::string> receiver_list;
-            std::istringstream receiver_iss(receivers);
-            std::string receiver;
-            while (std::getline(receiver_iss, receiver, ',')) {
-                receiver_list.push_back(receiver);
-            }
-            if (!receiver_list.empty() && !content.empty()) {
-                message = {{"type", "GROUP"}, {"receivers", receiver_list}, {"content", content}};
-            } else {
-                std::cout << "[ERROR] Invalid group message format" << std::endl;
-                continue;
-            }
-        } else {
-            message = {{"type", "BROADCAST"}, {"content", input}};
+        if (!buildMessageRequest(command, output, message)) {
+            continue;
         }
-
-        try {
-            boost::asio::write(socket, boost::asio::buffer(message.dump() + "\n"));
-            std::cout << "[SEND] Message sent: " << message.dump() << std::endl; // لاگ
-        } catch (const std::exception& e) {
-            std::cerr << "[ERROR] Send message error: " << e.what() << std::endl;
-            running = false;
+        if (!sendRequest(connection, output, message, "Message") &&
+            connection.isStopping()) {
             break;
         }
     }
 
-    if (socket.is_open()) {
-        socket.close();
-    }
-    receiveThread.join();
+    finishConnection(connection, "Client stopped");
+    output.line("[CLIENT] Connection closed");
 }
+
+} // namespace
 
 int main() {
     try {
-        runClient("194.9.56.182", "1403");
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Client error: " << e.what() << std::endl;
+        runClient(PROTECTED_CHAT_CLIENT_HOST, PROTECTED_CHAT_CLIENT_PORT);
+    } catch (const std::exception& error) {
+        std::cerr << "[ERROR] Client error: " << error.what() << std::endl;
         return 1;
     }
     return 0;
