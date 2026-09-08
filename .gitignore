@@ -23,6 +23,7 @@ compile_commands.json
 # Compiled files
 /server
 /client
+/user
 *.exe
 *.dll
 *.so
