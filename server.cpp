@@ -7,9 +7,13 @@
 
 #include <cctype>
 #include <condition_variable>
+#include <cstdint>
+#include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -37,6 +41,10 @@ enum class DeliveryResult {
     StoredOffline,
     Failed
 };
+
+constexpr std::size_t DefaultGroupListLimit = 50;
+constexpr std::size_t MaxGroupListLimit = 100;
+constexpr std::size_t MaxClientResponseJsonBytes = 1'048'576;
 
 class HandlerTracker {
 public:
@@ -99,6 +107,58 @@ bool readNonEmptyString(
     }
     value = found->get<std::string>();
     return !value.empty();
+}
+
+bool containsOnlyFields(
+    const json& request,
+    std::initializer_list<const char*> allowedFields) {
+    for (const auto& field : request.items()) {
+        bool allowed = false;
+        for (const char* allowedField : allowedFields) {
+            if (field.key() == allowedField) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool readSignedInteger(
+    const json& request,
+    const char* field,
+    std::int64_t& value) {
+    const auto found = request.find(field);
+    if (found == request.end()) {
+        return false;
+    }
+    if (found->is_number_unsigned()) {
+        const std::uint64_t unsignedValue = found->get<std::uint64_t>();
+        if (unsignedValue >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return false;
+        }
+        value = static_cast<std::int64_t>(unsignedValue);
+        return true;
+    }
+    if (!found->is_number_integer()) {
+        return false;
+    }
+    value = found->get<std::int64_t>();
+    return true;
+}
+
+bool isAsciiWhitespaceOnly(const std::string& text) {
+    for (const unsigned char character : text) {
+        if (character != ' ' && character != '\t' && character != '\r' &&
+            character != '\n' && character != '\f' && character != '\v') {
+            return false;
+        }
+    }
+    return true;
 }
 
 RequestReadResult readJsonRequest(
@@ -338,6 +398,213 @@ bool sendOperationResult(
     return session->sendJson(response) == SendResult::Written;
 }
 
+bool processGroupCreate(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& trustedUsername,
+    Database& database) {
+    std::string name;
+    if (!containsOnlyFields(request, {"type", "name"}) ||
+        !readNonEmptyString(request, "name", name) ||
+        name.size() > 128 || isAsciiWhitespaceOnly(name)) {
+        return sendFailure(session, "Invalid group name");
+    }
+
+    std::optional<GroupCreationResult> result;
+    try {
+        result.emplace(database.createGroup(trustedUsername, name));
+    } catch (const std::invalid_argument&) {
+        return sendFailure(session, "Invalid group name");
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[GROUP] Creation database failure: "
+                  << error.what() << std::endl;
+        return sendFailure(session, "Database error");
+    }
+
+    if (result->status() == GroupCreationStatus::DuplicateName) {
+        return session->sendJson({
+            {"status", "FAIL"},
+            {"message", "Group name exists"},
+            {"operation", "GROUP_CREATE"},
+            {"outcome", "DUPLICATE_NAME"}
+        }) == SendResult::Written;
+    }
+    if (result->status() == GroupCreationStatus::CreatorNotFound) {
+        return session->sendJson({
+            {"status", "FAIL"},
+            {"message", "Authenticated account not found"},
+            {"operation", "GROUP_CREATE"},
+            {"outcome", "CREATOR_NOT_FOUND"}
+        }) == SendResult::Written;
+    }
+    if (!result->group()) {
+        std::cerr << "[GROUP] Creation returned no group identity" << std::endl;
+        return sendFailure(session, "Database error");
+    }
+
+    const GroupSummary& group = *result->group();
+    return session->sendJson({
+        {"status", "SUCCESS"},
+        {"message", "Group created"},
+        {"operation", "GROUP_CREATE"},
+        {"outcome", "CREATED"},
+        {"group", {{"id", group.id()}, {"name", group.name()}}}
+    }) == SendResult::Written;
+}
+
+bool processGroupJoin(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& trustedUsername,
+    Database& database) {
+    std::int64_t groupId = 0;
+    if (!containsOnlyFields(request, {"type", "group_id"}) ||
+        !readSignedInteger(request, "group_id", groupId) || groupId <= 0) {
+        return sendFailure(session, "Invalid group ID");
+    }
+
+    std::optional<GroupJoinResult> result;
+    try {
+        result = database.joinGroup(trustedUsername, groupId);
+    } catch (const std::invalid_argument&) {
+        return sendFailure(session, "Invalid group ID");
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[GROUP] Join database failure: "
+                  << error.what() << std::endl;
+        return sendFailure(session, "Database error");
+    }
+
+    if (*result == GroupJoinResult::GroupNotFound) {
+        return session->sendJson({
+            {"status", "FAIL"},
+            {"message", "Group not found"},
+            {"operation", "GROUP_JOIN"},
+            {"outcome", "GROUP_NOT_FOUND"}
+        }) == SendResult::Written;
+    }
+    if (*result == GroupJoinResult::UserNotFound) {
+        return session->sendJson({
+            {"status", "FAIL"},
+            {"message", "Authenticated account not found"},
+            {"operation", "GROUP_JOIN"},
+            {"outcome", "USER_NOT_FOUND"}
+        }) == SendResult::Written;
+    }
+
+    const bool alreadyMember = *result == GroupJoinResult::AlreadyMember;
+    return session->sendJson({
+        {"status", "SUCCESS"},
+        {"message", alreadyMember ? "Already a member" : "Group joined"},
+        {"operation", "GROUP_JOIN"},
+        {"outcome", alreadyMember ? "ALREADY_MEMBER" : "JOINED"},
+        {"group_id", groupId}
+    }) == SendResult::Written;
+}
+
+bool buildGroupListResponse(
+    const GroupListResult& result,
+    std::int64_t afterGroupId,
+    json& response,
+    std::string& failureMessage) {
+    response = {
+        {"status", "SUCCESS"},
+        {"message", "Groups listed"},
+        {"operation", "GROUP_LIST"},
+        {"groups", json::array()},
+        {"has_more", result.hasMore()},
+        {"next_after_group_id", afterGroupId}
+    };
+
+    const std::vector<GroupSummary>& groups = result.groups();
+    for (std::size_t index = 0; index < groups.size(); ++index) {
+        const GroupSummary& group = groups[index];
+        json candidate = response;
+        candidate["groups"].push_back({
+            {"id", group.id()},
+            {"name", group.name()}
+        });
+        candidate["next_after_group_id"] = group.id();
+        candidate["has_more"] =
+            index + 1 < groups.size() || result.hasMore();
+
+        if (candidate.dump().size() > MaxClientResponseJsonBytes) {
+            if (response["groups"].empty()) {
+                failureMessage = "Group record exceeds response limit";
+                return false;
+            }
+            response["has_more"] = true;
+            return true;
+        }
+        response = std::move(candidate);
+    }
+    return true;
+}
+
+bool processGroupList(
+    const json& request,
+    const std::shared_ptr<ClientSession>& session,
+    const std::string& trustedUsername,
+    Database& database) {
+    if (!containsOnlyFields(
+            request, {"type", "after_group_id", "limit"})) {
+        return sendFailure(session, "Invalid group list request");
+    }
+
+    std::int64_t afterGroupId = 0;
+    const auto cursor = request.find("after_group_id");
+    if (cursor != request.end() &&
+        (!readSignedInteger(request, "after_group_id", afterGroupId) ||
+         afterGroupId < 0)) {
+        return sendFailure(session, "Invalid group list cursor");
+    }
+
+    std::size_t limit = DefaultGroupListLimit;
+    const auto requestedLimit = request.find("limit");
+    if (requestedLimit != request.end()) {
+        std::int64_t parsedLimit = 0;
+        if (!readSignedInteger(request, "limit", parsedLimit) ||
+            parsedLimit <= 0 ||
+            parsedLimit > static_cast<std::int64_t>(MaxGroupListLimit)) {
+            return sendFailure(session, "Invalid group list limit");
+        }
+        limit = static_cast<std::size_t>(parsedLimit);
+    }
+
+    std::optional<GroupListResult> result;
+    try {
+        result.emplace(
+            database.listGroupsForUser(
+                trustedUsername, afterGroupId, limit));
+    } catch (const std::invalid_argument&) {
+        return sendFailure(session, "Invalid group list request");
+    } catch (const std::runtime_error& error) {
+        std::cerr << "[GROUP] List database failure: "
+                  << error.what() << std::endl;
+        return sendFailure(session, "Database error");
+    }
+
+    if (result->status() == GroupListStatus::UserNotFound) {
+        return session->sendJson({
+            {"status", "FAIL"},
+            {"message", "Authenticated account not found"},
+            {"operation", "GROUP_LIST"},
+            {"outcome", "USER_NOT_FOUND"}
+        }) == SendResult::Written;
+    }
+
+    json response;
+    std::string failureMessage;
+    try {
+        if (!buildGroupListResponse(
+                *result, afterGroupId, response, failureMessage)) {
+            return sendFailure(session, failureMessage);
+        }
+    } catch (const json::exception&) {
+        return sendFailure(session, "Group data cannot be encoded");
+    }
+    return session->sendJson(response) == SendResult::Written;
+}
+
 bool processPrivateMessage(
     const json& request,
     const std::shared_ptr<ClientSession>& session,
@@ -477,6 +744,24 @@ void processMessages(
         if (type == "PRIVATE") {
             if (!processPrivateMessage(
                     request, session, sender, database, registry)) {
+                return;
+            }
+            continue;
+        }
+        if (type == "GROUP_CREATE") {
+            if (!processGroupCreate(request, session, sender, database)) {
+                return;
+            }
+            continue;
+        }
+        if (type == "GROUP_JOIN") {
+            if (!processGroupJoin(request, session, sender, database)) {
+                return;
+            }
+            continue;
+        }
+        if (type == "GROUP_LIST") {
+            if (!processGroupList(request, session, sender, database)) {
                 return;
             }
             continue;
