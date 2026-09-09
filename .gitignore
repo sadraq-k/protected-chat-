@@ -24,6 +24,7 @@ compile_commands.json
 /server
 /client
 /user
+/client-local
 *.exe
 *.dll
 *.so
