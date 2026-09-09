@@ -1,7 +1,7 @@
 #include "durable_routing.h"
 
 #include "client_session.h"
-#include "database.h"
+#include "../database.h"
 #include "session_registry.h"
 
 #include <nlohmann/json.hpp>

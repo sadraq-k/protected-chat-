@@ -149,6 +149,260 @@ bool validHistoryPage(const json& message) {
     return records->empty() || nextAfterMessageId == previousId;
 }
 
+bool stringIsOneOf(
+    const json& value,
+    std::initializer_list<const char*> expectedValues) {
+    if (!value.is_string()) {
+        return false;
+    }
+    const std::string actual = value.get<std::string>();
+    for (const char* expected : expectedValues) {
+        if (actual == expected) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool validDiscoveryFailure(
+    const json& message,
+    const std::string& operation) {
+    if (!containsOnlyFields(
+            message, {"status", "operation", "code", "message"})) {
+        return false;
+    }
+    const auto status = message.find("status");
+    const auto actualOperation = message.find("operation");
+    const auto code = message.find("code");
+    const auto detail = message.find("message");
+    if (status == message.end() || !status->is_string() ||
+        status->get<std::string>() != "FAIL" ||
+        actualOperation == message.end() || !actualOperation->is_string() ||
+        actualOperation->get<std::string>() != operation ||
+        code == message.end() || detail == message.end() ||
+        !detail->is_string()) {
+        return false;
+    }
+    if (operation == "CONTACT_ADD") {
+        return stringIsOneOf(
+            *code,
+            {"INVALID_REQUEST", "ACTOR_NOT_FOUND", "CONTACT_NOT_FOUND",
+             "SELF_CONTACT_NOT_ALLOWED", "DATABASE_ERROR",
+             "RECORD_UNREPRESENTABLE"});
+    }
+    return stringIsOneOf(
+        *code,
+        {"INVALID_REQUEST", "ACTOR_NOT_FOUND", "DATABASE_ERROR",
+         "RECORD_UNREPRESENTABLE"});
+}
+
+bool validUserSummary(const json& user, bool includeContactFlag) {
+    if (!user.is_object() ||
+        !containsOnlyFields(
+            user,
+            includeContactFlag
+                ? std::initializer_list<const char*>{
+                    "user_id", "username", "is_contact"}
+                : std::initializer_list<const char*>{
+                    "user_id", "username"})) {
+        return false;
+    }
+    std::int64_t userId = 0;
+    const auto username = user.find("username");
+    if (!readSignedInteger(user, "user_id", userId) || userId <= 0 ||
+        username == user.end() || !username->is_string()) {
+        return false;
+    }
+    if (includeContactFlag) {
+        const auto isContact = user.find("is_contact");
+        return isContact != user.end() && isContact->is_boolean();
+    }
+    return true;
+}
+
+bool validContactAddResponse(const json& message) {
+    const auto status = message.find("status");
+    if (status != message.end() && status->is_string() &&
+        status->get<std::string>() == "FAIL") {
+        return validDiscoveryFailure(message, "CONTACT_ADD");
+    }
+    if (!containsOnlyFields(
+            message,
+            {"status", "operation", "code", "message", "contact"})) {
+        return false;
+    }
+    const auto operation = message.find("operation");
+    const auto code = message.find("code");
+    const auto detail = message.find("message");
+    const auto contact = message.find("contact");
+    return status != message.end() && status->is_string() &&
+        status->get<std::string>() == "SUCCESS" &&
+        operation != message.end() && operation->is_string() &&
+        operation->get<std::string>() == "CONTACT_ADD" &&
+        code != message.end() &&
+        stringIsOneOf(*code, {"ADDED", "ALREADY_CONTACT"}) &&
+        detail != message.end() && detail->is_string() &&
+        contact != message.end() && validUserSummary(*contact, false);
+}
+
+bool validContactListResponse(const json& message) {
+    const auto status = message.find("status");
+    if (status != message.end() && status->is_string() &&
+        status->get<std::string>() == "FAIL") {
+        return validDiscoveryFailure(message, "CONTACT_LIST");
+    }
+    if (!containsOnlyFields(
+            message,
+            {"status", "operation", "code", "message", "contacts",
+             "next_after_user_id", "has_more"})) {
+        return false;
+    }
+    const auto operation = message.find("operation");
+    const auto code = message.find("code");
+    const auto detail = message.find("message");
+    const auto contacts = message.find("contacts");
+    const auto hasMore = message.find("has_more");
+    std::int64_t next = 0;
+    if (status == message.end() || !status->is_string() ||
+        status->get<std::string>() != "SUCCESS" ||
+        operation == message.end() || !operation->is_string() ||
+        operation->get<std::string>() != "CONTACT_LIST" ||
+        code == message.end() || !code->is_string() ||
+        code->get<std::string>() != "CONTACTS_PAGE" ||
+        detail == message.end() || !detail->is_string() ||
+        contacts == message.end() || !contacts->is_array() ||
+        contacts->size() > 100 || hasMore == message.end() ||
+        !hasMore->is_boolean() ||
+        !readSignedInteger(message, "next_after_user_id", next) || next < 0) {
+        return false;
+    }
+    std::int64_t previous = 0;
+    for (const json& contact : *contacts) {
+        std::int64_t userId = 0;
+        if (!validUserSummary(contact, false) ||
+            !readSignedInteger(contact, "user_id", userId) ||
+            userId <= previous) {
+            return false;
+        }
+        previous = userId;
+    }
+    return contacts->empty() || next == previous;
+}
+
+bool validUserSearchResponse(const json& message) {
+    const auto status = message.find("status");
+    if (status != message.end() && status->is_string() &&
+        status->get<std::string>() == "FAIL") {
+        return validDiscoveryFailure(message, "USER_SEARCH");
+    }
+    if (!containsOnlyFields(
+            message,
+            {"status", "operation", "code", "message", "query", "users",
+             "next_after_user_id", "has_more"})) {
+        return false;
+    }
+    const auto operation = message.find("operation");
+    const auto code = message.find("code");
+    const auto detail = message.find("message");
+    const auto query = message.find("query");
+    const auto users = message.find("users");
+    const auto hasMore = message.find("has_more");
+    std::int64_t next = 0;
+    if (status == message.end() || !status->is_string() ||
+        status->get<std::string>() != "SUCCESS" ||
+        operation == message.end() || !operation->is_string() ||
+        operation->get<std::string>() != "USER_SEARCH" ||
+        code == message.end() || !code->is_string() ||
+        code->get<std::string>() != "USERS_PAGE" ||
+        detail == message.end() || !detail->is_string() ||
+        query == message.end() || !query->is_string() ||
+        users == message.end() || !users->is_array() || users->size() > 100 ||
+        hasMore == message.end() || !hasMore->is_boolean() ||
+        !readSignedInteger(message, "next_after_user_id", next) || next < 0) {
+        return false;
+    }
+    std::int64_t previous = 0;
+    for (const json& user : *users) {
+        std::int64_t userId = 0;
+        if (!validUserSummary(user, true) ||
+            !readSignedInteger(user, "user_id", userId) || userId <= previous) {
+            return false;
+        }
+        previous = userId;
+    }
+    return users->empty() || next == previous;
+}
+
+bool validGroupSearchResponse(const json& message) {
+    const auto status = message.find("status");
+    if (status != message.end() && status->is_string() &&
+        status->get<std::string>() == "FAIL") {
+        return validDiscoveryFailure(message, "GROUP_SEARCH");
+    }
+    if (!containsOnlyFields(
+            message,
+            {"status", "operation", "code", "message", "query", "groups",
+             "next_after_group_id", "has_more"})) {
+        return false;
+    }
+    const auto operation = message.find("operation");
+    const auto code = message.find("code");
+    const auto detail = message.find("message");
+    const auto query = message.find("query");
+    const auto groups = message.find("groups");
+    const auto hasMore = message.find("has_more");
+    std::int64_t next = 0;
+    if (status == message.end() || !status->is_string() ||
+        status->get<std::string>() != "SUCCESS" ||
+        operation == message.end() || !operation->is_string() ||
+        operation->get<std::string>() != "GROUP_SEARCH" ||
+        code == message.end() || !code->is_string() ||
+        code->get<std::string>() != "GROUPS_PAGE" ||
+        detail == message.end() || !detail->is_string() ||
+        query == message.end() || !query->is_string() ||
+        groups == message.end() || !groups->is_array() || groups->size() > 100 ||
+        hasMore == message.end() || !hasMore->is_boolean() ||
+        !readSignedInteger(message, "next_after_group_id", next) || next < 0) {
+        return false;
+    }
+    std::int64_t previous = 0;
+    for (const json& group : *groups) {
+        if (!group.is_object() ||
+            !containsOnlyFields(
+                group, {"group_id", "name", "is_member"})) {
+            return false;
+        }
+        std::int64_t groupId = 0;
+        const auto name = group.find("name");
+        const auto isMember = group.find("is_member");
+        if (!readSignedInteger(group, "group_id", groupId) ||
+            groupId <= previous || name == group.end() || !name->is_string() ||
+            isMember == group.end() || !isMember->is_boolean()) {
+            return false;
+        }
+        previous = groupId;
+    }
+    return groups->empty() || next == previous;
+}
+
+bool validDiscoveryResponse(
+    const json& message,
+    const std::string& operation) {
+    if (operation == "CONTACT_ADD") {
+        return validContactAddResponse(message);
+    }
+    if (operation == "CONTACT_LIST") {
+        return validContactListResponse(message);
+    }
+    if (operation == "USER_SEARCH") {
+        return validUserSearchResponse(message);
+    }
+    if (operation == "GROUP_SEARCH") {
+        return validGroupSearchResponse(message);
+    }
+    return true;
+}
+
 } // namespace
 
 ClientConnection::ClientConnection()
@@ -540,6 +794,18 @@ bool ClientConnection::dispatchFrame(const json& message) {
          status->get<std::string>() == "FAIL") &&
         detail != message.end() && detail->is_string()) {
         const auto operation = message.find("operation");
+        if (operation != message.end() && operation->is_string()) {
+            const std::string operationName = operation->get<std::string>();
+            if ((operationName == "CONTACT_ADD" ||
+                 operationName == "CONTACT_LIST" ||
+                 operationName == "USER_SEARCH" ||
+                 operationName == "GROUP_SEARCH") &&
+                !validDiscoveryResponse(message, operationName)) {
+                emitDiagnostic("Invalid discovery response", true);
+                requestStop("Invalid discovery response");
+                return false;
+            }
+        }
         if (operation != message.end() && operation->is_string() &&
             operation->get<std::string>() == "DELIVERY_ACK") {
             std::int64_t messageId = 0;

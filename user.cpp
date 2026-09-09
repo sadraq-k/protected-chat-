@@ -1,5 +1,5 @@
-#include "client_connection.h"
-#include "console_input.h"
+#include "clientf/client_connection.h"
+#include "clientf/console_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -43,6 +43,22 @@ public:
 private:
     std::mutex mutex;
 };
+
+std::string safeDisplayText(const std::string& text) {
+    constexpr char HexDigits[] = "0123456789ABCDEF";
+    std::string safe;
+    safe.reserve(text.size());
+    for (const unsigned char character : text) {
+        if (character < 0x20 || character == 0x7f) {
+            safe += "\\x";
+            safe.push_back(HexDigits[character >> 4]);
+            safe.push_back(HexDigits[character & 0x0f]);
+        } else {
+            safe.push_back(static_cast<char>(character));
+        }
+    }
+    return safe;
+}
 
 bool readConsoleLine(
     ConsoleInput& input,
@@ -228,6 +244,120 @@ bool buildGroupListRequest(
     return true;
 }
 
+bool buildContactRequest(
+    const std::string& input,
+    ConsoleOutput& output,
+    json& message) {
+    if (input.rfind("CONTACT_ADD:", 0) == 0) {
+        const std::string username = input.substr(12);
+        if (username.empty()) {
+            output.error("[ERROR] Invalid contact-add arguments");
+            return false;
+        }
+        message = {{"type", "CONTACT_ADD"}, {"username", username}};
+        return true;
+    }
+    if (input == "CONTACT_ADD") {
+        output.error("[ERROR] Invalid contact-add arguments");
+        return false;
+    }
+    if (input == "CONTACT_LIST") {
+        message = {{"type", "CONTACT_LIST"}};
+        return true;
+    }
+    if (input.rfind("CONTACT_LIST:", 0) == 0) {
+        const std::string arguments = input.substr(13);
+        const std::size_t delimiter = arguments.find(':');
+        if (delimiter == std::string::npos ||
+            arguments.find(':', delimiter + 1) != std::string::npos) {
+            output.error("[ERROR] Invalid contact-list arguments");
+            return false;
+        }
+        std::int64_t afterUserId = 0;
+        std::int64_t limit = 0;
+        if (!parseIntegerInRange(
+                arguments.substr(0, delimiter),
+                0,
+                std::numeric_limits<std::int64_t>::max(),
+                afterUserId) ||
+            !parseIntegerInRange(
+                arguments.substr(delimiter + 1), 1, 100, limit)) {
+            output.error("[ERROR] Invalid contact-list arguments");
+            return false;
+        }
+        message = {
+            {"type", "CONTACT_LIST"},
+            {"after_user_id", afterUserId},
+            {"limit", limit}
+        };
+        return true;
+    }
+    return false;
+}
+
+bool buildSearchRequest(
+    const std::string& input,
+    ConsoleOutput& output,
+    const std::string& operation,
+    const std::string& simplePrefix,
+    const std::string& pagePrefix,
+    const char* cursorField,
+    json& message) {
+    if (input.rfind(simplePrefix, 0) == 0) {
+        const std::string query = input.substr(simplePrefix.size());
+        if (query.empty()) {
+            output.error("[ERROR] Invalid search query");
+            return false;
+        }
+        message = {
+            {"type", operation},
+            {"query", query},
+            {cursorField, 0},
+            {"limit", 50}
+        };
+        return true;
+    }
+    if (input.rfind(pagePrefix, 0) == 0) {
+        const std::string arguments = input.substr(pagePrefix.size());
+        const std::size_t first = arguments.find(':');
+        const std::size_t second = first == std::string::npos
+            ? std::string::npos : arguments.find(':', first + 1);
+        if (first == std::string::npos || second == std::string::npos) {
+            output.error("[ERROR] Invalid search-page arguments");
+            return false;
+        }
+        std::int64_t cursor = 0;
+        std::int64_t limit = 0;
+        const std::string query = arguments.substr(second + 1);
+        if (!parseIntegerInRange(
+                arguments.substr(0, first),
+                0,
+                std::numeric_limits<std::int64_t>::max(),
+                cursor) ||
+            !parseIntegerInRange(
+                arguments.substr(first + 1, second - first - 1),
+                1,
+                100,
+                limit) ||
+            query.empty()) {
+            output.error("[ERROR] Invalid search-page arguments");
+            return false;
+        }
+        message = {
+            {"type", operation},
+            {"query", query},
+            {cursorField, cursor},
+            {"limit", limit}
+        };
+        return true;
+    }
+    if (input == operation || input == operation + "_PAGE") {
+        output.error("[ERROR] Invalid search arguments");
+        return false;
+    }
+    return false;
+}
+
 bool buildHistoryRequest(
     const std::string& input,
     ConsoleOutput& output,
@@ -360,12 +490,43 @@ bool buildMessageRequest(
         return buildGroupListRequest(input, output, message);
     }
 
+    if (input == "CONTACT_ADD" || input.rfind("CONTACT_ADD:", 0) == 0 ||
+        input == "CONTACT_LIST" || input.rfind("CONTACT_LIST:", 0) == 0) {
+        return buildContactRequest(input, output, message);
+    }
+
+    if (input == "USER_SEARCH" || input == "USER_SEARCH_PAGE" ||
+        input.rfind("USER_SEARCH:", 0) == 0 ||
+        input.rfind("USER_SEARCH_PAGE:", 0) == 0) {
+        return buildSearchRequest(
+            input,
+            output,
+            "USER_SEARCH",
+            "USER_SEARCH:",
+            "USER_SEARCH_PAGE:",
+            "after_user_id",
+            message);
+    }
+
+    if (input == "GROUP_SEARCH" || input == "GROUP_SEARCH_PAGE" ||
+        input.rfind("GROUP_SEARCH:", 0) == 0 ||
+        input.rfind("GROUP_SEARCH_PAGE:", 0) == 0) {
+        return buildSearchRequest(
+            input,
+            output,
+            "GROUP_SEARCH",
+            "GROUP_SEARCH:",
+            "GROUP_SEARCH_PAGE:",
+            "after_group_id",
+            message);
+    }
+
     if (input == "HISTORY" || input.rfind("HISTORY:", 0) == 0) {
         return buildHistoryRequest(input, output, message);
     }
 
     output.error(
-        "[ERROR] Use PRIVATE, GROUP, BROADCAST, group, HISTORY, SYNC, or exit commands");
+        "[ERROR] Use messaging, group, contact, search, HISTORY, SYNC, or exit commands");
     return false;
 }
 
@@ -444,6 +605,73 @@ void runClient(const std::string& host, const std::string& port) {
                         return;
                     }
                 }
+                if (operationName == "CONTACT_ADD" && status == "SUCCESS") {
+                    const json& contact = message.at("contact");
+                    output.line(
+                        "[CONTACT " + std::to_string(
+                            contact.at("user_id").get<std::int64_t>()) +
+                        "] " + safeDisplayText(
+                            contact.at("username").get<std::string>()) +
+                        " (" + message.at("code").get<std::string>() + ")");
+                    return;
+                }
+                if (operationName == "CONTACT_LIST" && status == "SUCCESS") {
+                    for (const json& contact : message.at("contacts")) {
+                        output.line(
+                            "[CONTACT " + std::to_string(
+                                contact.at("user_id").get<std::int64_t>()) +
+                            "] " + safeDisplayText(
+                                contact.at("username").get<std::string>()));
+                    }
+                    output.line(
+                        "[CONTACT_LIST] next=" + std::to_string(
+                            message.at("next_after_user_id").get<std::int64_t>()) +
+                        " has_more=" +
+                        (message.at("has_more").get<bool>() ? "true" : "false"));
+                    return;
+                }
+                if (operationName == "USER_SEARCH" && status == "SUCCESS") {
+                    output.line(
+                        "[USER_SEARCH] query=" + safeDisplayText(
+                            message.at("query").get<std::string>()));
+                    for (const json& user : message.at("users")) {
+                        output.line(
+                            "[USER " + std::to_string(
+                                user.at("user_id").get<std::int64_t>()) +
+                            "] " + safeDisplayText(
+                                user.at("username").get<std::string>()) +
+                            " contact=" +
+                            (user.at("is_contact").get<bool>()
+                                ? "true" : "false"));
+                    }
+                    output.line(
+                        "[USER_SEARCH] next=" + std::to_string(
+                            message.at("next_after_user_id").get<std::int64_t>()) +
+                        " has_more=" +
+                        (message.at("has_more").get<bool>() ? "true" : "false"));
+                    return;
+                }
+                if (operationName == "GROUP_SEARCH" && status == "SUCCESS") {
+                    output.line(
+                        "[GROUP_SEARCH] query=" + safeDisplayText(
+                            message.at("query").get<std::string>()));
+                    for (const json& group : message.at("groups")) {
+                        output.line(
+                            "[GROUP " + std::to_string(
+                                group.at("group_id").get<std::int64_t>()) +
+                            "] " + safeDisplayText(
+                                group.at("name").get<std::string>()) +
+                            " member=" +
+                            (group.at("is_member").get<bool>()
+                                ? "true" : "false"));
+                    }
+                    output.line(
+                        "[GROUP_SEARCH] next=" + std::to_string(
+                            message.at("next_after_group_id").get<std::int64_t>()) +
+                        " has_more=" +
+                        (message.at("has_more").get<bool>() ? "true" : "false"));
+                    return;
+                }
                 if (operationName == "GROUP_LIST" && status == "SUCCESS") {
                     for (const json& group : message.at("groups")) {
                         output.line(
@@ -517,7 +745,7 @@ void runClient(const std::string& host, const std::string& port) {
                 output,
                 connection,
                 "Command (PRIVATE/GROUP/BROADCAST/GROUP_CREATE/GROUP_JOIN/"
-                "GROUP_LIST/HISTORY/SYNC/exit): ",
+                "GROUP_LIST/CONTACT/SEARCH/HISTORY/SYNC/exit): ",
                 command)) {
             if (connection.isAuthenticated() && !connection.isStopping()) {
                 sendRequest(connection, output, {{"type", "EXIT"}}, "EXIT");

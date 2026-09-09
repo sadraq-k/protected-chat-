@@ -1,7 +1,8 @@
-#include "client_session.h"
+#include "serverf/client_session.h"
 #include "database.h"
-#include "durable_routing.h"
-#include "session_registry.h"
+#include "serverf/discovery_protocol.h"
+#include "serverf/durable_routing.h"
+#include "serverf/session_registry.h"
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -552,6 +553,14 @@ void processMessages(
             return;
         }
         if (durableResult == DurableRequestResult::Handled) {
+            continue;
+        }
+        const DiscoveryRequestResult discoveryResult =
+            handleDiscoveryRequest(request, session, database);
+        if (discoveryResult == DiscoveryRequestResult::Stop) {
+            return;
+        }
+        if (discoveryResult == DiscoveryRequestResult::Handled) {
             continue;
         }
         if (type == "GROUP_CREATE") {

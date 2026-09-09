@@ -73,6 +73,19 @@ enum class GroupRecipientSnapshotStatus {
     SenderNotMember
 };
 
+enum class ContactAddStatus {
+    Added,
+    AlreadyContact,
+    OwnerNotFound,
+    ContactNotFound,
+    SelfContactNotAllowed
+};
+
+enum class DiscoveryReadStatus {
+    Ready,
+    ActorNotFound
+};
+
 class GroupSummary {
 public:
     GroupSummary(std::int64_t id, std::string name);
@@ -83,6 +96,107 @@ public:
 private:
     std::int64_t groupId;
     std::string groupName;
+};
+
+class UserSummary {
+public:
+    UserSummary(std::int64_t id, std::string username);
+
+    std::int64_t id() const noexcept;
+    const std::string& username() const noexcept;
+
+private:
+    std::int64_t userId;
+    std::string userName;
+};
+
+class UserSearchEntry {
+public:
+    UserSearchEntry(UserSummary user, bool isContact);
+
+    const UserSummary& user() const noexcept;
+    bool isContact() const noexcept;
+
+private:
+    UserSummary foundUser;
+    bool contact;
+};
+
+class GroupSearchEntry {
+public:
+    GroupSearchEntry(GroupSummary group, bool isMember);
+
+    const GroupSummary& group() const noexcept;
+    bool isMember() const noexcept;
+
+private:
+    GroupSummary foundGroup;
+    bool member;
+};
+
+class ContactAddResult {
+public:
+    ContactAddResult(
+        ContactAddStatus status,
+        std::optional<UserSummary> contact = std::nullopt);
+
+    ContactAddStatus status() const noexcept;
+    const std::optional<UserSummary>& contact() const noexcept;
+
+private:
+    ContactAddStatus addStatus;
+    std::optional<UserSummary> addedContact;
+};
+
+class ContactListResult {
+public:
+    ContactListResult(
+        DiscoveryReadStatus status,
+        std::vector<UserSummary> contacts,
+        bool hasMore);
+
+    DiscoveryReadStatus status() const noexcept;
+    const std::vector<UserSummary>& contacts() const noexcept;
+    bool hasMore() const noexcept;
+
+private:
+    DiscoveryReadStatus readStatus;
+    std::vector<UserSummary> listedContacts;
+    bool moreContacts;
+};
+
+class UserSearchResult {
+public:
+    UserSearchResult(
+        DiscoveryReadStatus status,
+        std::vector<UserSearchEntry> users,
+        bool hasMore);
+
+    DiscoveryReadStatus status() const noexcept;
+    const std::vector<UserSearchEntry>& users() const noexcept;
+    bool hasMore() const noexcept;
+
+private:
+    DiscoveryReadStatus readStatus;
+    std::vector<UserSearchEntry> foundUsers;
+    bool moreUsers;
+};
+
+class GroupSearchResult {
+public:
+    GroupSearchResult(
+        DiscoveryReadStatus status,
+        std::vector<GroupSearchEntry> groups,
+        bool hasMore);
+
+    DiscoveryReadStatus status() const noexcept;
+    const std::vector<GroupSearchEntry>& groups() const noexcept;
+    bool hasMore() const noexcept;
+
+private:
+    DiscoveryReadStatus readStatus;
+    std::vector<GroupSearchEntry> foundGroups;
+    bool moreGroups;
 };
 
 class GroupCreationResult {
@@ -356,6 +470,24 @@ public:
     GroupRecipientSnapshot getGroupRecipientSnapshot(
         const std::string& trustedUsername,
         std::int64_t groupId);
+
+    ContactAddResult addContact(
+        const std::string& trustedOwnerUsername,
+        const std::string& contactUsername);
+    ContactListResult listContacts(
+        const std::string& trustedOwnerUsername,
+        std::int64_t afterUserId,
+        std::size_t pageLimit);
+    UserSearchResult searchUsers(
+        const std::string& trustedRequesterUsername,
+        const std::string& query,
+        std::int64_t afterUserId,
+        std::size_t pageLimit);
+    GroupSearchResult searchGroups(
+        const std::string& trustedRequesterUsername,
+        const std::string& query,
+        std::int64_t afterGroupId,
+        std::size_t pageLimit);
 };
 
 #endif
