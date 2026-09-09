@@ -1,5 +1,6 @@
 #include "client_session.h"
 #include "database.h"
+#include "durable_routing.h"
 #include "session_registry.h"
 
 #include <boost/asio.hpp>
@@ -34,12 +35,6 @@ enum class RequestReadResult {
     InvalidCompleteFrame,
     TooLarge,
     Closed
-};
-
-enum class DeliveryResult {
-    Delivered,
-    StoredOffline,
-    Failed
 };
 
 constexpr std::size_t DefaultGroupListLimit = 50;
@@ -302,102 +297,6 @@ bool authenticate(
     return true;
 }
 
-DeliveryResult sendMessageToUser(
-    const std::string& sender,
-    const std::string& receiver,
-    const std::string& content,
-    Database& database,
-    SessionRegistry& registry) {
-    const std::shared_ptr<ClientSession> target = registry.findReady(receiver);
-    if (!target) {
-        database.storeOfflineMessages(sender, receiver, content);
-        return DeliveryResult::StoredOffline;
-    }
-
-    const json response = {
-        {"type", "MESSAGE"},
-        {"sender", sender},
-        {"content", content}
-    };
-    if (target->sendJson(response) == SendResult::Written) {
-        return DeliveryResult::Delivered;
-    }
-
-    target->requestStop();
-    registry.removeIfSame(receiver, target);
-    return DeliveryResult::Failed;
-}
-
-bool broadcastMessage(
-    const std::string& sender,
-    const std::string& content,
-    SessionRegistry& registry) {
-    const auto targets = registry.snapshotReadyExcept(sender);
-    const json response = {
-        {"type", "MESSAGE"},
-        {"sender", sender},
-        {"content", content}
-    };
-
-    bool allWritten = true;
-    for (const auto& target : targets) {
-        if (target.second->sendJson(response) == SendResult::Written) {
-            continue;
-        }
-        allWritten = false;
-        target.second->requestStop();
-        registry.removeIfSame(target.first, target.second);
-    }
-    return allWritten;
-}
-
-bool replayOfflineMessages(
-    const std::shared_ptr<ClientSession>& session,
-    Database& database) {
-    std::vector<Message> messages;
-    try {
-        messages = database.getOfflineMessages(session->authenticatedUsername());
-    } catch (const std::runtime_error& error) {
-        std::cerr << "[OFFLINE] Fetch database failure: "
-                  << error.what() << std::endl;
-        sendFailure(session, "Database error");
-        return false;
-    }
-
-    for (const Message& message : messages) {
-        const json response = {
-            {"type", "MESSAGE"},
-            {"sender", message.sender},
-            {"content", message.message}
-        };
-        if (session->sendJson(response) != SendResult::Written) {
-            return false;
-        }
-    }
-
-    try {
-        database.clearOfflineMessages(session->authenticatedUsername());
-    } catch (const std::runtime_error& error) {
-        std::cerr << "[OFFLINE] Clear database failure: "
-                  << error.what() << std::endl;
-        sendFailure(session, "Database error");
-        return false;
-    }
-    return true;
-}
-
-bool sendOperationResult(
-    const std::shared_ptr<ClientSession>& session,
-    bool success,
-    const std::string& successMessage,
-    const std::string& failureMessage) {
-    const json response = {
-        {"status", success ? "SUCCESS" : "FAIL"},
-        {"message", success ? successMessage : failureMessage}
-    };
-    return session->sendJson(response) == SendResult::Written;
-}
-
 bool processGroupCreate(
     const json& request,
     const std::shared_ptr<ClientSession>& session,
@@ -605,101 +504,6 @@ bool processGroupList(
     return session->sendJson(response) == SendResult::Written;
 }
 
-bool processPrivateMessage(
-    const json& request,
-    const std::shared_ptr<ClientSession>& session,
-    const std::string& sender,
-    Database& database,
-    SessionRegistry& registry) {
-    std::string receiver;
-    std::string content;
-    if (!readNonEmptyString(request, "receiver", receiver) ||
-        !readNonEmptyString(request, "content", content)) {
-        return sendFailure(session, "Invalid private message format");
-    }
-
-    try {
-        const DeliveryResult result =
-            sendMessageToUser(sender, receiver, content, database, registry);
-        return sendOperationResult(
-            session,
-            result != DeliveryResult::Failed,
-            "Private message sent",
-            "Message delivery failed");
-    } catch (const std::runtime_error& error) {
-        std::cerr << "[MESSAGE] Private database failure: "
-                  << error.what() << std::endl;
-        return sendFailure(session, "Database error");
-    }
-}
-
-bool processGroupMessage(
-    const json& request,
-    const std::shared_ptr<ClientSession>& session,
-    const std::string& sender,
-    Database& database,
-    SessionRegistry& registry) {
-    std::string content;
-    const auto receivers = request.find("receivers");
-    if (!readNonEmptyString(request, "content", content) ||
-        receivers == request.end() ||
-        !receivers->is_array() ||
-        receivers->empty()) {
-        return sendFailure(session, "Invalid group message format");
-    }
-
-    std::vector<std::string> validatedReceivers;
-    for (const json& receiver : *receivers) {
-        if (!receiver.is_string()) {
-            return sendFailure(session, "Invalid group message format");
-        }
-        std::string value = receiver.get<std::string>();
-        if (value.empty()) {
-            return sendFailure(session, "Invalid group message format");
-        }
-        validatedReceivers.push_back(std::move(value));
-    }
-
-    bool allDelivered = true;
-    try {
-        for (const std::string& receiver : validatedReceivers) {
-            if (sendMessageToUser(
-                    sender, receiver, content, database, registry) ==
-                DeliveryResult::Failed) {
-                allDelivered = false;
-                break;
-            }
-        }
-    } catch (const std::runtime_error& error) {
-        std::cerr << "[MESSAGE] Group database failure: "
-                  << error.what() << std::endl;
-        return sendFailure(session, "Database error");
-    }
-
-    return sendOperationResult(
-        session,
-        allDelivered,
-        "Group message sent",
-        "Message delivery failed");
-}
-
-bool processBroadcastMessage(
-    const json& request,
-    const std::shared_ptr<ClientSession>& session,
-    const std::string& sender,
-    SessionRegistry& registry) {
-    std::string content;
-    if (!readNonEmptyString(request, "content", content)) {
-        return sendFailure(session, "Invalid broadcast message format");
-    }
-
-    return sendOperationResult(
-        session,
-        broadcastMessage(sender, content, registry),
-        "Broadcast message sent",
-        "Message delivery failed");
-}
-
 void processMessages(
     const std::shared_ptr<ClientSession>& session,
     Database& database,
@@ -741,11 +545,13 @@ void processMessages(
         if (type == "EXIT") {
             return;
         }
-        if (type == "PRIVATE") {
-            if (!processPrivateMessage(
-                    request, session, sender, database, registry)) {
-                return;
-            }
+
+        const DurableRequestResult durableResult =
+            handleDurableRequest(request, session, database, registry);
+        if (durableResult == DurableRequestResult::Stop) {
+            return;
+        }
+        if (durableResult == DurableRequestResult::Handled) {
             continue;
         }
         if (type == "GROUP_CREATE") {
@@ -766,20 +572,6 @@ void processMessages(
             }
             continue;
         }
-        if (type == "GROUP") {
-            if (!processGroupMessage(
-                    request, session, sender, database, registry)) {
-                return;
-            }
-            continue;
-        }
-        if (type == "BROADCAST") {
-            if (!processBroadcastMessage(request, session, sender, registry)) {
-                return;
-            }
-            continue;
-        }
-
         if (!sendFailure(session, "Invalid message type")) {
             return;
         }
@@ -808,8 +600,7 @@ void handleClient(
     HandlerTracker& handlers) noexcept {
     try {
         std::cout << "[CONNECTION] Client connected" << std::endl;
-        if (authenticate(session, database, registry) &&
-            replayOfflineMessages(session, database)) {
+        if (authenticate(session, database, registry)) {
             processMessages(session, database, registry);
         }
     } catch (...) {
@@ -823,6 +614,13 @@ void handleClient(
 void runServer(const std::string& ip, int port) {
     boost::asio::io_context ioContext;
     Database database("chat.db");
+    const std::int64_t imported = database.importLegacyMessages();
+    if (imported > 0) {
+        std::cout << "[DB] Imported " << imported
+                  << " legacy deliveries as durable Private messages; "
+                  << "original timestamps and routing context were unavailable"
+                  << std::endl;
+    }
     SessionRegistry registry;
     HandlerTracker handlers;
 

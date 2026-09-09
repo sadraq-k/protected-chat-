@@ -34,6 +34,20 @@ enum class AcknowledgementResult {
     NotFoundOrNotRecipient
 };
 
+enum class MessageAcceptanceStatus {
+    Accepted,
+    SenderNotFound,
+    RecipientNotFound,
+    SelfMessageNotAllowed,
+    GroupNotFound,
+    SenderNotMember
+};
+
+enum class MessagePageStatus {
+    Ready,
+    UserNotFound
+};
+
 enum class GroupCreationStatus {
     Created,
     DuplicateName,
@@ -142,6 +156,78 @@ private:
     std::int64_t messageCreatedAt;
 };
 
+class DeliveryMessage {
+public:
+    DeliveryMessage(StoredMessage message, std::string senderUsername);
+
+    const StoredMessage& message() const noexcept;
+    const std::string& senderUsername() const noexcept;
+
+private:
+    StoredMessage storedMessage;
+    std::string messageSenderUsername;
+};
+
+class RecipientRoute {
+public:
+    RecipientRoute(std::int64_t userId, std::string username);
+
+    std::int64_t userId() const noexcept;
+    const std::string& username() const noexcept;
+
+private:
+    std::int64_t recipientUserId;
+    std::string recipientUsername;
+};
+
+class AcceptedMessage {
+public:
+    AcceptedMessage(
+        DeliveryMessage message,
+        std::vector<RecipientRoute> recipients);
+
+    const DeliveryMessage& message() const noexcept;
+    const std::vector<RecipientRoute>& recipients() const noexcept;
+
+private:
+    DeliveryMessage acceptedDeliveryMessage;
+    std::vector<RecipientRoute> acceptedRecipients;
+};
+
+class MessageAcceptanceResult {
+public:
+    MessageAcceptanceResult(
+        MessageAcceptanceStatus status,
+        std::optional<AcceptedMessage> acceptedMessage = std::nullopt);
+
+    MessageAcceptanceStatus status() const noexcept;
+    const std::optional<AcceptedMessage>& acceptedMessage() const noexcept;
+
+private:
+    MessageAcceptanceStatus acceptanceStatus;
+    std::optional<AcceptedMessage> committedMessage;
+};
+
+class MessagePageResult {
+public:
+    MessagePageResult(
+        MessagePageStatus status,
+        std::vector<DeliveryMessage> messages,
+        std::int64_t throughMessageId,
+        bool hasMore);
+
+    MessagePageStatus status() const noexcept;
+    const std::vector<DeliveryMessage>& messages() const noexcept;
+    std::int64_t throughMessageId() const noexcept;
+    bool hasMore() const noexcept;
+
+private:
+    MessagePageStatus pageStatus;
+    std::vector<DeliveryMessage> pageMessages;
+    std::int64_t pageThroughMessageId;
+    bool moreMessages;
+};
+
 class Database {
 private:
     sqlite3* db;
@@ -169,6 +255,12 @@ private:
         const std::optional<std::int64_t>& groupId,
         const std::string& content,
         const std::vector<std::int64_t>& recipientIds);
+    AcceptedMessage buildAcceptedMessageCallerLocked(
+        std::int64_t messageId,
+        const std::string& senderUsername);
+    AcknowledgementResult acknowledgeMessageCallerLocked(
+        std::int64_t messageId,
+        std::int64_t recipientId);
 
     std::string hashPassword(const std::string& password) {
         unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -221,6 +313,32 @@ public:
         std::int64_t requesterId,
         std::int64_t afterMessageId,
         std::size_t pageLimit);
+
+    MessageAcceptanceResult acceptPrivateMessage(
+        const std::string& trustedSenderUsername,
+        const std::string& recipientUsername,
+        const std::string& content);
+    MessageAcceptanceResult acceptGroupMessage(
+        const std::string& trustedSenderUsername,
+        std::int64_t groupId,
+        const std::string& content);
+    MessageAcceptanceResult acceptBroadcastMessage(
+        const std::string& trustedSenderUsername,
+        const std::string& content);
+    MessagePageResult getPendingDeliveryPage(
+        const std::string& trustedUsername,
+        std::int64_t afterMessageId,
+        const std::optional<std::int64_t>& throughMessageId,
+        std::size_t pageLimit);
+    MessagePageResult getHistoryDeliveryPage(
+        const std::string& trustedUsername,
+        std::int64_t afterMessageId,
+        const std::optional<std::int64_t>& throughMessageId,
+        std::size_t pageLimit);
+    AcknowledgementResult acknowledgeDelivery(
+        const std::string& trustedUsername,
+        std::int64_t messageId);
+    std::int64_t importLegacyMessages();
 
     // The username is supplied by trusted authenticated application code.
     GroupCreationResult createGroup(

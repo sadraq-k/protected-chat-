@@ -7,8 +7,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -33,6 +36,7 @@ class ClientConnection {
 public:
     static constexpr std::size_t MaxOutboundJsonBytes = 65'536;
     static constexpr std::size_t MaxInboundJsonBytes = 1'048'576;
+    static constexpr std::size_t MaxAutomaticRequests = 256;
 
     using FrameHandler =
         std::function<void(ClientFrameKind, const nlohmann::json&)>;
@@ -57,6 +61,9 @@ public:
     ClientSendResult sendJson(const nlohmann::json& message);
     AuthenticationResult waitForAuthentication(std::string& message);
     void beginPostAuthentication();
+    void setAutomaticRequestNotifier(std::function<void()> notifier);
+    bool startPendingSynchronization();
+    bool flushAutomaticRequests();
 
     bool isAuthenticated() const noexcept;
     bool isStopping() const noexcept;
@@ -80,6 +87,10 @@ private:
     FrameReadResult readFrame(std::string& frame);
     void receiveLoop() noexcept;
     bool dispatchFrame(const nlohmann::json& message);
+    bool processDeliveryMessage(const nlohmann::json& message);
+    bool processPendingPage(const nlohmann::json& message);
+    bool enqueueDeliveryAcknowledgement(std::int64_t messageId);
+    void notifyAutomaticRequest() noexcept;
     void completeAuthentication(
         AuthenticationResult result,
         const std::string& message);
@@ -91,6 +102,12 @@ private:
     std::string receiveBuffer;
     std::thread receiverThread;
     std::mutex writeMutex;
+    std::mutex automaticRequestMutex;
+    std::deque<nlohmann::json> automaticRequests;
+    std::function<void()> automaticRequestNotifier;
+    bool pendingSynchronizationActive;
+    std::int64_t pendingAfterMessageId;
+    std::optional<std::int64_t> pendingThroughMessageId;
     mutable std::mutex stateMutex;
     std::condition_variable stateChanged;
     FrameHandler frameHandler;

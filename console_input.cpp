@@ -13,6 +13,7 @@
 
 ConsoleInput::ConsoleInput()
     : interrupted(false),
+      workPending(false),
       endOfFileSeen(false)
 #ifndef _WIN32
       , wakeReadDescriptor(-1),
@@ -61,6 +62,13 @@ ConsoleReadResult ConsoleInput::readLine(std::string& line) {
     std::array<char, ReadChunkBytes> chunk{};
 
     while (true) {
+        if (interrupted.load(std::memory_order_acquire)) {
+            return ConsoleReadResult::Interrupted;
+        }
+        if (workPending.exchange(false, std::memory_order_acq_rel)) {
+            return ConsoleReadResult::WorkAvailable;
+        }
+
         const std::size_t newline = inputBuffer.find('\n');
         if (newline != std::string::npos) {
             if (newline > MaxLineBytes) {
@@ -88,10 +96,6 @@ ConsoleReadResult ConsoleInput::readLine(std::string& line) {
             }
             return ConsoleReadResult::Line;
         }
-        if (interrupted.load(std::memory_order_acquire)) {
-            return ConsoleReadResult::Interrupted;
-        }
-
         pollfd descriptors[2] = {
             {STDIN_FILENO, POLLIN, 0},
             {wakeReadDescriptor, POLLIN, 0}
@@ -107,7 +111,13 @@ ConsoleReadResult ConsoleInput::readLine(std::string& line) {
         if ((descriptors[1].revents & (POLLIN | POLLHUP)) != 0) {
             while (::read(wakeReadDescriptor, chunk.data(), chunk.size()) > 0) {
             }
-            return ConsoleReadResult::Interrupted;
+            if (interrupted.load(std::memory_order_acquire)) {
+                return ConsoleReadResult::Interrupted;
+            }
+            if (workPending.exchange(false, std::memory_order_acq_rel)) {
+                return ConsoleReadResult::WorkAvailable;
+            }
+            continue;
         }
         if ((descriptors[1].revents & (POLLERR | POLLNVAL)) != 0) {
             return ConsoleReadResult::Failure;
@@ -133,6 +143,21 @@ ConsoleReadResult ConsoleInput::readLine(std::string& line) {
         if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) {
             return ConsoleReadResult::Failure;
         }
+    }
+#endif
+}
+
+void ConsoleInput::notifyWork() noexcept {
+    bool expected = false;
+    if (!workPending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+#ifndef _WIN32
+    if (wakeWriteDescriptor != -1) {
+        const char signal = 1;
+        const ssize_t ignored = ::write(wakeWriteDescriptor, &signal, 1);
+        (void)ignored;
     }
 #endif
 }

@@ -7,6 +7,7 @@
 
 enum class ConsoleReadResult {
     Line,
+    WorkAvailable,
     EndOfFile,
     Interrupted,
     TooLong,
@@ -27,11 +28,13 @@ public:
     ConsoleInput& operator=(ConsoleInput&&) = delete;
 
     ConsoleReadResult readLine(std::string& line);
+    void notifyWork() noexcept;
     void interrupt() noexcept;
 
 private:
     std::string inputBuffer;
     std::atomic<bool> interrupted;
+    std::atomic<bool> workPending;
     bool endOfFileSeen;
 #ifndef _WIN32
     int wakeReadDescriptor;
