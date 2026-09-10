@@ -1,9 +1,11 @@
 #include "clientf/client_connection.h"
 #include "clientf/console_input.h"
 #include "clientf/terminal_ui.h"
+#include "clientf/terminal_screen.h"
 
 #include <nlohmann/json.hpp>
 
+#include <clocale>
 #include <iostream>
 #include <string>
 
@@ -156,6 +158,7 @@ bool buildAuthenticationRequest(
 }
 
 void runClient(const std::string& host, const std::string& port) {
+    std::setlocale(LC_CTYPE, "");
     ConsoleInput input;
     ConsoleOutput output;
     ClientConnection connection;
@@ -177,9 +180,8 @@ void runClient(const std::string& host, const std::string& port) {
             [&ui](ClientFrameKind kind, const json& message) {
                 ui.handleFrame(kind, message);
             },
-            [&output](const std::string& message, bool error) {
-                output.event(
-                    std::string(error ? "[ERROR] " : "[CLIENT] ") + message);
+            [&ui](const std::string& message, bool error) {
+                ui.handleDiagnostic(message, error);
             },
             [&input] { input.interrupt(); });
     } catch (const std::system_error& error) {
@@ -214,19 +216,26 @@ void runClient(const std::string& host, const std::string& port) {
         }
 
         output.line("Authentication successful! " + authenticationMessage);
-        connection.beginPostAuthentication();
-        if (!connection.startPendingSynchronization()) {
-            finishConnection(
-                connection, "Initial pending synchronization failed");
-            return;
-        }
+        ui.setAuthenticatedUsername(
+            authenticationRequest.at("username").get<std::string>());
+        std::string finalSummary;
+        {
+            TerminalScreen terminal(input);
+            connection.beginPostAuthentication();
+            if (!connection.startPendingSynchronization()) {
+                finishConnection(
+                    connection, "Initial pending synchronization failed");
+                return;
+            }
 
-        ui.run();
-        if (connection.isAuthenticated() && !connection.isStopping()) {
-            connection.sendJson({{"type", "EXIT"}});
+            ui.run(terminal);
+            if (connection.isAuthenticated() && !connection.isStopping()) {
+                connection.sendJson({{"type", "EXIT"}});
+            }
+            finishConnection(connection, "Client stopped");
+            finalSummary = ui.finalSummary();
         }
-        finishConnection(connection, "Client stopped");
-        output.line("[CLIENT] Connection closed");
+        output.line(finalSummary);
     } catch (...) {
         finishConnection(connection, "Client exception");
         throw;

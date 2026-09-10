@@ -63,7 +63,8 @@ public:
     void beginPostAuthentication();
     void setAutomaticRequestNotifier(std::function<void()> notifier);
     bool startPendingSynchronization();
-    bool flushAutomaticRequests();
+    bool flushAutomaticRequests(
+        std::size_t maximumRequests = MaxAutomaticRequests);
 
     bool isAuthenticated() const noexcept;
     bool isStopping() const noexcept;

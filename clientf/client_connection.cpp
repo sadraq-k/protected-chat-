@@ -525,8 +525,9 @@ bool ClientConnection::startPendingSynchronization() {
     return true;
 }
 
-bool ClientConnection::flushAutomaticRequests() {
-    while (!isStopping()) {
+bool ClientConnection::flushAutomaticRequests(std::size_t maximumRequests) {
+    std::size_t flushed = 0;
+    while (!isStopping() && flushed < maximumRequests) {
         json request;
         {
             std::lock_guard<std::mutex> lock(automaticRequestMutex);
@@ -541,8 +542,20 @@ bool ClientConnection::flushAutomaticRequests() {
             requestStop("Automatic request write failed");
             return false;
         }
+        ++flushed;
     }
-    return false;
+    if (isStopping()) {
+        return false;
+    }
+    bool workRemains = false;
+    {
+        std::lock_guard<std::mutex> lock(automaticRequestMutex);
+        workRemains = !automaticRequests.empty();
+    }
+    if (workRemains) {
+        notifyAutomaticRequest();
+    }
+    return true;
 }
 
 bool ClientConnection::isAuthenticated() const noexcept {
@@ -782,6 +795,9 @@ bool ClientConnection::dispatchFrame(const json& message) {
     if (type != message.end() && type->is_string() &&
         type->get<std::string>() == "MESSAGE") {
         if (!processDeliveryMessage(message)) {
+            if (isStopping()) {
+                return false;
+            }
             emitDiagnostic("Ignored an invalid MESSAGE event", true);
         }
         return true;
@@ -824,8 +840,15 @@ bool ClientConnection::dispatchFrame(const json& message) {
         }
         if (operation != message.end() && operation->is_string() &&
             operation->get<std::string>() == "SYNC_PENDING") {
-            if (status->get<std::string>() != "SUCCESS" ||
-                !processPendingPage(message)) {
+            if (status->get<std::string>() != "SUCCESS") {
+                emitDiagnostic("Pending synchronization failed", true);
+                requestStop("Pending synchronization failed");
+                return false;
+            }
+            if (!processPendingPage(message)) {
+                if (isStopping()) {
+                    return false;
+                }
                 emitDiagnostic("Pending synchronization failed", true);
                 requestStop("Pending synchronization failed");
                 return false;
@@ -856,6 +879,9 @@ bool ClientConnection::processDeliveryMessage(const json& message) {
     }
     if (frameHandler) {
         frameHandler(ClientFrameKind::Message, message);
+    }
+    if (isStopping()) {
+        return false;
     }
     std::int64_t messageId = 0;
     readSignedInteger(message, "message_id", messageId);
@@ -953,6 +979,13 @@ bool ClientConnection::processPendingPage(const json& message) {
         if (frameHandler) {
             frameHandler(ClientFrameKind::Message, record);
         }
+        if (isStopping()) {
+            return false;
+        }
+    }
+
+    if (isStopping()) {
+        return false;
     }
 
     bool queued = false;
