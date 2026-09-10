@@ -1,7 +1,7 @@
 #ifndef DURABLE_ROUTING_H
 #define DURABLE_ROUTING_H
 
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 

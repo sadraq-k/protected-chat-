@@ -673,7 +673,7 @@ void runServer(const std::string& ip, int port) {
 
 int main() {
     try {
-        runServer("127.0.0.1", PROTECTED_CHAT_SERVER_PORT);
+        runServer("0.0.0.0", PROTECTED_CHAT_SERVER_PORT);
     } catch (const std::exception& error) {
         std::cerr << "[SERVER] Startup failure: " << error.what() << std::endl;
         return 1;
