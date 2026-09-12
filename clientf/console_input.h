@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <string>
 
 enum class ConsoleReadResult {
@@ -48,7 +49,9 @@ public:
     void disableResizeNotifications() noexcept;
 
 private:
-#ifndef _WIN32
+#ifdef _WIN32
+    class WindowsState;
+#else
     ConsoleEvent readPosixEvent();
     bool fillEventInput(int timeoutMilliseconds, ConsoleKey& wakeEvent);
     void writeWakeByte(char byte) noexcept;
@@ -69,6 +72,8 @@ private:
     bool resizeNotificationsEnabled;
     bool previousResizeActionValid;
     alignas(void*) unsigned char previousResizeActionStorage[256];
+#else
+    std::unique_ptr<WindowsState> windowsState;
 #endif
 };
 

@@ -2,6 +2,7 @@
 #define PROTECTED_CHAT_TERMINAL_SCREEN_H
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,10 @@ public:
 
 private:
     void restore() noexcept;
+    void writeOutput(const std::string& bytes);
+#ifdef _WIN32
+    class WindowsState;
+#endif
     ConsoleInput& input;
     bool terminalChanged;
     bool screenEntered;
@@ -67,6 +72,8 @@ private:
     mutable bool lastSizeQueryFailed;
 #ifndef _WIN32
     alignas(void*) unsigned char originalSettingsStorage[128];
+#else
+    std::unique_ptr<WindowsState> windowsState;
 #endif
 };
 
